@@ -5,6 +5,15 @@ over-privileged actions in Agent Skills. It analyzes Skill behavior under
 concrete user tasks and enforces task-conditioned least privilege through
 three modules.
 
+## Paper
+
+**SkillScope: Toward Fine-Grained Least-Privilege Enforcement for Agent Skills**
+
+Accepted at ACM CCS 2026.
+
+- [Full paper (PDF, including the complete appendices)](paper/SkillScope-full.pdf)
+- Conference paper DOI: [10.1145/3830454.3846588](https://doi.org/10.1145/3830454.3846588)
+
 ## Framework Overview
 
 ### 1. Over-Privilege Candidate Extraction
