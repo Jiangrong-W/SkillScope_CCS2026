@@ -1325,6 +1325,16 @@ class TracedSkillAgentRuntime:
                         "instruction_summary": node.summary,
                         "explicit_command": command_text,
                         "command_execution_mode": "sandboxed_inline_command",
+                        "instruction_source_file": node.source_file,
+                        "instruction_source_range": (
+                            {
+                                "start_line": node.source_range.start_line,
+                                "end_line": node.source_range.end_line,
+                                "start_column": node.source_range.start_column,
+                                "end_column": node.source_range.end_column,
+                            }
+                            if node.source_range is not None else None
+                        ),
                     },
                 )
             )
@@ -1336,6 +1346,8 @@ class TracedSkillAgentRuntime:
             tokens = shlex.split(command_text, posix=True)
         except ValueError:
             return False
+        if not tokens:
+            return False
         normalized_target = Path(target).as_posix()
         target_name = Path(target).name
         executable = tokens[0]
@@ -1344,7 +1356,8 @@ class TracedSkillAgentRuntime:
             or Path(executable).name == target_name
         ):
             return True
-        if Path(executable).name not in {
+        executable_name = Path(executable).name
+        if executable_name not in {
             "bash",
             "deno",
             "node",
@@ -1353,7 +1366,7 @@ class TracedSkillAgentRuntime:
             "python3",
             "sh",
             "ts-node",
-        }:
+        } and not re.fullmatch(r"python(?:[23](?:\.\d+)?)?", executable_name):
             return False
         for token in tokens[1:]:
             if token.startswith("-"):

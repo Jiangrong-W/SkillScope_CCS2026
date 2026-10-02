@@ -12,6 +12,7 @@ from skillscope.common.llm import (
     StructuredLLMClient,
     complete_validated_json,
 )
+from skillscope.common.utils.serialization import to_plain_data
 
 
 ResponseValidator = Callable[[dict[str, Any]], tuple[dict[str, Any] | None, list[str]]]
@@ -81,7 +82,7 @@ class ValidatedLLMCaller:
             response = complete_validated_json(
                 counting_client,
                 system_prompt=system_prompt,
-                user_prompt=json.dumps(payload, ensure_ascii=False, indent=2),
+                user_prompt=json.dumps(to_plain_data(payload), ensure_ascii=False, indent=2),
                 schema_name=schema_name,
                 contract=contract,
                 max_attempts=self.max_attempts,

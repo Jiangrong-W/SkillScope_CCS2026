@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import ast
+import hashlib
 import json
 import re
 import shlex
 import shutil
 import subprocess
+import sys
 import tempfile
 import urllib.parse
 from dataclasses import dataclass, field
@@ -252,8 +255,33 @@ class InlineCommandTool:
     name = "inline_command"
     supported_suffixes: tuple[str, ...] = ()
 
-    def __init__(self, policy: SandboxPolicy | None = None) -> None:
+    _PYTHON_IMPORT_ROOTS = frozenset({
+        "ast", "binascii", "bisect", "codecs", "collections", "copy", "csv",
+        "datetime", "decimal", "fractions", "functools", "hashlib", "heapq",
+        "io", "itertools", "json", "math", "operator", "pathlib", "random",
+        "re", "statistics", "string", "struct", "unicodedata", "zlib",
+    })
+    _PYTHON_CONTEXT_NAMES = frozenset({
+        "os", "sys", "eval", "exec", "compile", "globals", "locals", "vars",
+        "getattr", "setattr", "delattr", "dir", "input", "breakpoint", "help",
+        "attrgetter", "methodcaller",
+    })
+    _PYTHON_CONTEXT_ATTRIBUTES = _PYTHON_CONTEXT_NAMES | frozenset({
+        "argv", "environ", "getenv", "chdir", "glob", "rglob", "iterdir",
+        "stat", "lstat", "walk", "scandir", "listdir", "attrgetter", "methodcaller",
+        "format", "format_map", "vformat", "get_field", "get_value", "Formatter",
+    })
+
+    def __init__(
+        self,
+        policy: SandboxPolicy | None = None,
+        *,
+        python_runner: SandboxedPythonRunner | None = None,
+    ) -> None:
         self.policy = policy or SandboxPolicy()
+        self.python_runner = python_runner or SandboxedPythonRunner(
+            Path(__file__).resolve().parents[3], self.policy,
+        )
 
     def invoke(self, request: ToolInvocationRequest) -> ToolInvocationResult:
         sandbox_root = Path(request.sandbox_root).resolve()
@@ -265,6 +293,11 @@ class InlineCommandTool:
             return self._blocked(request, "inline_command_invalid_length")
         if "\x00" in command_text or "\r" in command_text or "\n" in command_text:
             return self._blocked(request, "inline_command_contains_control_character")
+
+        literal_python = self._literal_python_payload(command_text, sandbox_root)
+        if literal_python is not None:
+            tokens, body = literal_python
+            return self._invoke_literal_python(request, command_text, tokens, body)
 
         bash_binary = shutil.which("bash")
         if bash_binary is None:
@@ -373,6 +406,149 @@ class InlineCommandTool:
                 "filesystem_root": str(sandbox_root),
             },
         )
+
+    def _literal_python_payload(
+        self,
+        command_text: str,
+        sandbox_root: Path,
+    ) -> tuple[list[str], str] | None:
+        try:
+            tokens = shlex.split(command_text, posix=True)
+            if len(tokens) != 4 or tokens[1:3] != ["-S", "-c"]:
+                return None
+            if not re.fullmatch(r"python(?:[23](?:\.\d+)?)?", Path(tokens[0]).name):
+                return None
+            if not Path(tokens[0]).is_absolute():
+                return None
+            # Canonical shell quoting excludes expansion, redirection, extra
+            # shell commands and unknown interpreter options without inspecting
+            # semicolons or dollar signs inside the quoted Python payload.
+            if command_text != shlex.join(tokens):
+                return None
+            if Path(tokens[0]).resolve(strict=True) != Path(sys.executable).resolve(strict=True):
+                return None
+            wrapper = ast.parse(tokens[3])
+            if len(wrapper.body) != 1 or not isinstance(wrapper.body[0], ast.Expr):
+                return None
+            call = wrapper.body[0].value
+            if not (
+                isinstance(call, ast.Call)
+                and isinstance(call.func, ast.Name) and call.func.id == "exec"
+                and len(call.args) == 1 and not call.keywords
+                and isinstance(call.args[0], ast.Constant)
+                and isinstance(call.args[0].value, str)
+            ):
+                return None
+            body = call.args[0].value
+            tree = ast.parse(body)
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Name) and (
+                    node.id.startswith("__") or node.id in self._PYTHON_CONTEXT_ATTRIBUTES
+                ):
+                    return None
+                if isinstance(node, ast.Attribute) and (
+                    node.attr.startswith("_") or node.attr in self._PYTHON_CONTEXT_ATTRIBUTES
+                ):
+                    return None
+                if isinstance(node, ast.Constant) and isinstance(node.value, str) and re.search(r"__[A-Za-z0-9_]+__", node.value):
+                    return None
+                if isinstance(node, (ast.Import, ast.ImportFrom)):
+                    if isinstance(node, ast.ImportFrom):
+                        if node.level or not node.module:
+                            return None
+                        imports = [node.module]
+                    else:
+                        imports = [item.name for item in node.names]
+                    if any(
+                        item.name == "*"
+                        or any(part.startswith("_") or part in self._PYTHON_CONTEXT_ATTRIBUTES for part in item.name.split("."))
+                        or (item.asname is not None and (item.asname.startswith("_") or item.asname in self._PYTHON_CONTEXT_ATTRIBUTES))
+                        for item in node.names
+                    ):
+                        return None
+                    for module in imports:
+                        root = module.split(".")[0]
+                        if root not in self._PYTHON_IMPORT_ROOTS:
+                            return None
+                        if (sandbox_root / (root + ".py")).exists() or (sandbox_root / root).exists():
+                            return None
+                        if any(
+                            entry.name == root + ".pyc"
+                            or (entry.name.startswith(root + ".") and entry.suffix in {".so", ".pyd"})
+                            for entry in sandbox_root.iterdir()
+                        ):
+                            return None
+            return tokens, body
+        except (OSError, ValueError, SyntaxError, RecursionError):
+            return None
+
+    def _invoke_literal_python(
+        self,
+        request: ToolInvocationRequest,
+        command_text: str,
+        tokens: list[str],
+        body: str,
+    ) -> ToolInvocationResult:
+        sandbox_root = Path(request.sandbox_root).resolve()
+        temporary_source: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", suffix=".py",
+                prefix=".skillscope-inline-python-", dir=sandbox_root, delete=False,
+            ) as handle:
+                temporary_source = Path(handle.name)
+                handle.write(body)
+            result = PythonScriptTool(self.python_runner).invoke(ToolInvocationRequest(
+                tool_call_id=request.tool_call_id,
+                tool_name="python_script",
+                target=temporary_source.name,
+                sandbox_root=request.sandbox_root,
+                prompt=request.prompt,
+                instruction_node_id=request.instruction_node_id,
+            ))
+            # Match the existing inline tool's result contract; script-only
+            # return-value synthesis and temporary paths are not command output.
+            result.final_output = result.stdout.strip() or f"Executed {request.target}"
+            provenance = {
+                "inline_python_instrumented": True,
+                "inline_instruction_command": True,
+                "trace_granularity": "instrumented_python",
+                "instruction_command_sha256": hashlib.sha256(command_text.encode("utf-8")).hexdigest(),
+                "instruction_node_id": request.instruction_node_id,
+                "instruction_source_file": request.metadata.get("instruction_source_file"),
+                "instruction_source_range": request.metadata.get("instruction_source_range"),
+                "inline_python_body_sha256": hashlib.sha256(body.encode("utf-8")).hexdigest(),
+            }
+            for event in result.trace_events:
+                event["attributes"] = dict(event.get("attributes") or {}) | provenance
+                if event.get("event_type") in {"script_start", "script_end"}:
+                    event["attributes"]["instruction_command"] = command_text
+            starts = [
+                event for event in result.trace_events
+                if event.get("event_type") == "script_start"
+                and event["attributes"].get("script_relative_path") == temporary_source.name
+            ]
+            if len(starts) == 1:
+                result.trace_events.insert(0, {
+                    "event_type": "exec_command",
+                    "summary": "Execute statically unwrapped literal inline Python command",
+                    "object_ref": tokens[0],
+                    "arguments_summary": command_text[:500],
+                    "attributes": provenance | {
+                        "material_operation": "exec_command",
+                        "runtime_command": command_text,
+                        "runtime_command_tokens": tokens,
+                        "runtime_evidence": "python_instrumented_inline_command_start",
+                        "temporal_order_observed": True,
+                        "execution_count_observed": True,
+                    },
+                })
+            result.metadata.update(provenance | {"instruction_command": command_text})
+            result.metadata.update({"tool_name": self.name, "target": request.target})
+            return result
+        finally:
+            if temporary_source is not None:
+                temporary_source.unlink(missing_ok=True)
 
     def _blocked(
         self,

@@ -54,7 +54,8 @@ class ReplayRunner:
 
         try:
             original_installed_skill = self.sandboxed_agent.install_skill(
-                Path(analysis.bundle.root_path)
+                Path(analysis.bundle.root_path),
+                analysis=analysis,
             )
             original_instruction_plan = (
                 self._instruction_plan(

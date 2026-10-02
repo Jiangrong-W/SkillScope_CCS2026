@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 from collections import defaultdict
 from typing import Any
@@ -175,6 +176,17 @@ class RepairPlanner:
                 item=item,
                 clusters=clusters,
             )
+            # Supplemental physical evidence is attached only after planning;
+            # no execution metadata, outputs, fixtures or reference answers
+            # enter either the planner payload or the source projection.
+            if candidate.layer == "instruction" and item.metadata.get("candidate_semantics", {}).get("operation_type") in {
+                "execute", "exec_command", "command_execution", "read", "file_read", "read_file"
+            }:
+                witnesses = self._original_execution_witnesses(
+                    candidate=candidate, item=item, validation=validation
+                )
+                if witnesses:
+                    item.metadata["original_execution_witnesses"] = witnesses
             items.append(item)
 
         confirmed_overreach_ids = sorted(item.overreach_id for item in items)
@@ -204,6 +216,67 @@ class RepairPlanner:
                 "permanent_pruning_enabled": False,
             },
         )
+
+    @staticmethod
+    def _original_execution_witnesses(
+        *, candidate: CandidateAction, item: RepairItem, validation: ValidationResult
+    ) -> list[dict[str, Any]]:
+        witnesses = []
+        contexts = item.metadata.get("descriptor_contexts")
+        if not isinstance(contexts, list) or not contexts:
+            return []
+        for context in contexts:
+            if not isinstance(context, dict) or context.get("candidate_id") != candidate.candidate_id:
+                return []
+            task_id = context.get("task_id")
+            prompt = context.get("task_context", {}).get("intent")
+            pairs = [pair for pair in validation.replay_pairs
+                     if pair.candidate_id == candidate.candidate_id and pair.task_id == task_id]
+            triggers = [trigger for trigger in validation.trigger_evidence
+                        if trigger.candidate_id == candidate.candidate_id and trigger.task_id == task_id]
+            if len(pairs) != 1 or len(triggers) != 1:
+                return []
+            record, trigger = pairs[0].original, triggers[0]
+            if (record.mode != "original" or record.status != "completed"
+                    or record.prompt != prompt or trigger.triggered is not True
+                    or trigger.candidate_node_id != candidate.node_id
+                    or not record.run_id or trigger.execution_run_id != record.run_id
+                    or record.metadata.get("trace_truncated") is True
+                    or any(event.attributes.get("trace_truncated") is True for event in record.trace)):
+                return []
+            trace = []
+            provenance_keys = {
+                "instruction_node_id", "tool_name", "tool_call_id", "status", "instruction_source_file",
+                "instruction_source_range", "instruction_command_sha256", "inline_python_body_sha256",
+                "inline_python_instrumented", "inline_instruction_command", "trace_granularity",
+                "runtime_command", "runtime_command_tokens", "runtime_evidence", "temporal_order_observed",
+                "execution_count_observed", "source_file", "line_number", "source_start_line", "source_end_line",
+                "source_start_column", "source_end_column", "script_relative_path", "material_operation",
+                "blocked", "ablated", "disabled", "simulated",
+                "material", "trace_truncated",
+            }
+            for event in record.trace:
+                payload = {
+                    "event_type": event.event_type, "node_id": event.node_id,
+                    "object_ref": event.object_ref,
+                    "attributes": {key: copy.deepcopy(value) for key, value in event.attributes.items()
+                                   if key in provenance_keys},
+                }
+                source_range = payload["attributes"].get("instruction_source_range")
+                if isinstance(source_range, dict):
+                    payload["attributes"]["instruction_source_range"] = {
+                        key: value for key, value in source_range.items()
+                        if key in {"start_line", "end_line", "start_column", "end_column"}
+                    }
+                trace.append(payload)
+            witnesses.append({
+                "candidate_id": candidate.candidate_id, "task_id": task_id,
+                "node_id": candidate.node_id, "execution_run_id": trigger.execution_run_id,
+                "record": {"run_id": record.run_id, "status": record.status,
+                           "prompt": record.prompt,
+                           "trace": trace},
+            })
+        return witnesses
 
     def _annotate_with_llm_if_valid(
         self,

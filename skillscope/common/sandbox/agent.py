@@ -9,7 +9,7 @@ from typing import Any, Protocol
 
 from skillscope.common.config import AppConfig
 from skillscope.common.llm import DisabledLLMClient, PromptAssetLoader, StructuredLLMClient
-from skillscope.common.models import ExecutionRecord, InstalledSkill, ResourceFixture
+from skillscope.common.models import CandidateExtractionResult, ExecutionRecord, InstalledSkill, ResourceFixture
 
 from .agent_runtime import TracedSkillAgentRuntime
 from .policy import SandboxPolicy, SandboxPolicyError
@@ -81,7 +81,7 @@ class SandboxedSkillAgent:
                     PythonScriptTool(self.python_runner),
                     ShellScriptTool(self.sandbox_policy),
                     NodeScriptTool(self.sandbox_policy),
-                    InlineCommandTool(self.sandbox_policy),
+                    InlineCommandTool(self.sandbox_policy, python_runner=self.python_runner),
                 ]
             )
         )
@@ -111,7 +111,16 @@ class SandboxedSkillAgent:
             fixture_toolchain = MCPBackedFixtureToolchain()
         self.fixture_toolchain = fixture_toolchain
 
-    def install_skill(self, skill_root: Path) -> InstalledSkill:
+    def install_skill(
+        self,
+        skill_root: Path,
+        *,
+        analysis: CandidateExtractionResult | None = None,
+    ) -> InstalledSkill:
+        if analysis is not None:
+            # A cached independent graph can reuse IDs with different meanings.
+            # Explicit analyses always install their own graph snapshot.
+            return self.installer.install(skill_root, analysis=analysis)
         resolved_root = str(skill_root.resolve())
         installed_skill = self._installed_skill_cache.get(resolved_root)
         if installed_skill is not None:

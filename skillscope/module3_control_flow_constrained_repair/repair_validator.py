@@ -103,7 +103,7 @@ class RepairValidator:
         core_preserved_count = 0
         goal_satisfied_count = 0
         patched_installed_skill = self.sandboxed_agent.install_skill(
-            patched_bundle_root
+            patched_bundle_root, analysis=patched_analysis
         )
 
         for context_index, context in enumerate(contexts, start=1):
@@ -642,7 +642,7 @@ class RepairValidator:
             for value in item.metadata.get("covered_code_summaries", [])
         }
         core_summaries = [
-            summary
+            (task.chain_node_ids[index] if index < len(task.chain_node_ids) else None, summary)
             for index, summary in enumerate(task.chain_summaries)
             if index != candidate_position
             and (index >= len(task.chain_node_ids) or task.chain_node_ids[index] not in covered_instruction_ids)
@@ -672,8 +672,19 @@ class RepairValidator:
                 record=record,
                 patched_analysis=patched_analysis,
                 projection_integrity_entry=projection_integrity_entry,
+                original_analysis=original_analysis,
+                original_instruction_node_id=node_id,
             )
-            for summary in core_summaries
+            or self._projected_predicate_preserved(
+                node_id=node_id,
+                item=item,
+                original_analysis=original_analysis,
+                original_record=original_record,
+                patched_analysis=patched_analysis,
+                patched_record=record,
+                integrity=projection_integrity_entry,
+            )
+            for node_id, summary in core_summaries
         )
 
     def _core_instruction_coverage(
@@ -836,6 +847,196 @@ class RepairValidator:
             })
         return covered
 
+    def _grounded_original_invocation(
+        self, *, original_analysis: CandidateExtractionResult | None,
+        node_id: str | None, item: RepairItem, expected_tokens: list[str],
+    ) -> bool:
+        if original_analysis is None or node_id is None:
+            return False
+        node = original_analysis.ueg.node_by_id(node_id)
+        if (node is None or node.layer != "instruction"
+                or node.operation_type not in {"execute", "invoke", "run"}
+                or node.source_range is None or not node.raw_text):
+            return False
+        root = Path(original_analysis.bundle.root_path).resolve()
+        source = (root / str(node.source_file or "")).resolve()
+        if not source.is_relative_to(root) or not source.is_file():
+            return False
+        try:
+            content = source.read_text(encoding="utf-8")
+            invocation = InstructionRewriter()._grounded_dispatch_invocation(
+                content=content, item=item,
+            )
+        except (OSError, UnicodeError, RuntimeError):
+            return False
+        line = int(invocation["line_number"])
+        matched_text = str(invocation.get("matched_text") or "")
+        if not matched_text or matched_text not in node.raw_text:
+            return False
+        start_column = node.source_range.start_column
+        end_column = node.source_range.end_column
+        if (line == node.source_range.start_line and start_column is not None
+                and start_column > int(invocation["start_column"])):
+            return False
+        if (line == node.source_range.end_line and end_column is not None
+                and end_column < int(invocation["end_column"])):
+            return False
+        return bool(
+            node.source_range.start_line <= line <= node.source_range.end_line
+            and node.raw_text in content.splitlines()[line - 1]
+            and invocation["tokens"] == expected_tokens
+        )
+
+    def _projected_predicate_preserved(
+        self, *, node_id: str | None, item: RepairItem,
+        original_analysis: CandidateExtractionResult | None,
+        original_record: ExecutionRecord | None,
+        patched_analysis: CandidateExtractionResult,
+        patched_record: ExecutionRecord,
+        integrity: dict[str, object] | None,
+    ) -> bool:
+        # Line tracing evaluates a Python predicate without necessarily assigning
+        # its graph ID. Require the identical predicate in a verified source
+        # variant and matching real Python tool-bound header visits in both runs.
+        if (original_analysis is None or original_record is None
+                or original_record.status != "completed"
+                or patched_record.status != "completed" or node_id is None
+                or item.metadata.get("safe_semantic_proof_complete") is not True
+                or not isinstance(integrity, dict)
+                or any(integrity.get(key) is not True for key in (
+                    "complete", "unit_hashes_valid", "safe_semantics_valid",
+                    "neutralization_complete",
+                ))):
+            return False
+        node = original_analysis.ueg.node_by_id(node_id)
+        if (node is None or node.layer != "code"
+                or node.node_type != "CODE_PREDICATE" or not node.raw_text
+                or node.source_file != item.source_file or node.source_range is None):
+            return False
+        original_root = Path(original_analysis.bundle.root_path).resolve()
+        original_source = (original_root / node.source_file).resolve()
+        if not original_source.is_relative_to(original_root):
+            return False
+        try:
+            if hashlib.sha256(original_source.read_bytes()).hexdigest() != item.metadata.get("original_source_sha256"):
+                return False
+        except OSError:
+            return False
+
+        def same_predicate(target: object) -> bool:
+            return bool(
+                target.layer == "code" and target.node_type == node.node_type
+                and target.raw_text == node.raw_text
+                and target.operation_type == node.operation_type
+                and target.attributes.get("scope_name") == node.attributes.get("scope_name")
+                and target.attributes.get("predicate_kind") == node.attributes.get("predicate_kind")
+                and target.source_range is not None
+            )
+
+        if sum(
+            same_predicate(target) and target.source_file == node.source_file
+            for target in original_analysis.ueg.nodes
+        ) != 1:
+            return False
+
+        def visits(record: ExecutionRecord, target: object) -> list[tuple[str, int]] | None:
+            source_file = target.source_file
+            source_range = target.source_range
+            scope = target.attributes.get("scope_name")
+            if source_range is None or not isinstance(scope, str) or not scope:
+                return None
+            calls = [
+                (index, event.attributes.get("tool_call_id"))
+                for index, event in enumerate(record.trace)
+                if event.event_type == "tool_call_start"
+                and event.object_ref == source_file
+            ]
+            call_ids = [call_id for _, call_id in calls]
+            if (not calls or any(not isinstance(call_id, str) or not call_id for call_id in call_ids)
+                    or len(call_ids) != len(set(call_ids))):
+                return None
+            for event in record.trace:
+                if (event.event_type in {"script_start", "script_end", "line"}
+                        and event.attributes.get("source_file") == source_file
+                        and event.attributes.get("tool_call_id") not in call_ids):
+                    return None
+            result: list[tuple[str, int]] = []
+            previous_end = -1
+            for call_index, call_id in calls:
+                bound = [
+                    (index, event) for index, event in enumerate(record.trace)
+                    if event.attributes.get("tool_call_id") == call_id
+                ]
+                boundaries = {
+                    kind: [(index, event) for index, event in bound if event.event_type == kind]
+                    for kind in ("tool_call_start", "script_start", "script_end", "tool_call_end")
+                }
+                if any(len(events) != 1 for events in boundaries.values()):
+                    return None
+                start_index, tool_start = boundaries["tool_call_start"][0]
+                script_start_index, script_start = boundaries["script_start"][0]
+                script_end_index, script_end = boundaries["script_end"][0]
+                end_index, tool_end = boundaries["tool_call_end"][0]
+                if (start_index != call_index or start_index <= previous_end
+                        or not start_index < script_start_index < script_end_index < end_index
+                        or any(event.object_ref != source_file
+                               or event.attributes.get("tool_name") != "python_script"
+                               for event in (tool_start, script_start, script_end, tool_end))
+                        or script_start.attributes.get("source_file") != source_file
+                        or script_start.attributes.get("script_relative_path") != source_file
+                        or script_end.attributes.get("source_file") != source_file
+                        or script_end.attributes.get("status") != "completed"
+                        or tool_end.attributes.get("status") != "completed"
+                        or any(event.event_type in {"script_error", "tool_call_error"}
+                               for _, event in bound)):
+                    return None
+                count = 0
+                for index, event in bound:
+                    if event.event_type != "line":
+                        continue
+                    if (not script_start_index < index < script_end_index
+                            or event.attributes.get("tool_name") != "python_script"):
+                        return None
+                    if (event.attributes.get("source_file") == source_file
+                            and event.attributes.get("line_number") == source_range.start_line
+                            and event.attributes.get("function_name") == scope):
+                        count += 1
+                result.append((call_id, count))
+                previous_end = end_index
+            return result
+
+        original_visits = visits(original_record, node)
+        if not original_visits or not sum(count for _, count in original_visits):
+            return False
+        units = self._projected_execution_units(item)
+        observed_units = {
+            event.object_ref for event in patched_record.trace
+            if event.event_type == "tool_call_start" and event.object_ref in units
+        }
+        if len(observed_units) != 1:
+            return False
+        projected_nodes = [
+            target for target in patched_analysis.ueg.nodes
+            if target.source_file in observed_units and same_predicate(target)
+        ]
+        if len(projected_nodes) != 1:
+            return False
+        projected = projected_nodes[0]
+        projected_visits = visits(patched_record, projected)
+        original_counts = [count for _, count in original_visits]
+        if projected_visits is None or [count for _, count in projected_visits] != original_counts:
+            return False
+        patched_record.metadata.setdefault("projected_predicate_coverage_evidence", []).append({
+            "original_node_id": node_id, "projected_node_id": projected.node_id,
+            "original_source_file": node.source_file,
+            "projected_source_file": projected.source_file,
+            "tool_bound_header_visits": sum(original_counts),
+            "tool_bound_header_visit_counts": original_counts,
+            "original_tool_call_ids": [call_id for call_id, _ in original_visits],
+            "projected_tool_call_ids": [call_id for call_id, _ in projected_visits],
+        })
+        return True
+
     def _projected_invocation_preserved(
         self,
         *,
@@ -845,6 +1046,8 @@ class RepairValidator:
         record: ExecutionRecord,
         patched_analysis: CandidateExtractionResult,
         projection_integrity_entry: dict[str, object] | None = None,
+        original_analysis: CandidateExtractionResult | None = None,
+        original_instruction_node_id: str | None = None,
     ) -> bool:
         """Match an original script invocation to its executed repair unit.
 
@@ -873,7 +1076,11 @@ class RepairValidator:
         normalized_source = self._normalize(source_file)
         summary_tokens = set(normalized_summary.split())
         invocation_verbs = {"run", "invoke", "execute", "call"}
-        if not normalized_source or not invocation_verbs & summary_tokens:
+        requires_grounded_use = bool(
+            normalized_summary.startswith("use ")
+            and not invocation_verbs & summary_tokens
+        )
+        if not normalized_source or not (invocation_verbs & summary_tokens or requires_grounded_use):
             return False
 
         template = item.metadata.get("instruction_invocation_template")
@@ -924,14 +1131,33 @@ class RepairValidator:
                 parser = InstructionRewriter()
                 exact_summary_commands = self._inline_command_tokens(summary)
                 exact_original = original_tokens in exact_summary_commands
-                template_matches = bool(
-                    parser._direct_command_script_index(original_tokens) == len(invocation_prefix)
-                    and (exact_original or (
-                        len(invocation_prefix) == 1 and not suffix_tokens
-                        and language_tokens & summary_tokens
-                        and normalized_source in normalized_summary
-                    ))
-                )
+                if requires_grounded_use:
+                    template_matches = bool(
+                        parser._direct_command_script_index(original_tokens) == len(invocation_prefix)
+                        and (exact_original or (len(invocation_prefix) == 1 and not suffix_tokens))
+                        and self._grounded_original_invocation(
+                            original_analysis=original_analysis,
+                            node_id=original_instruction_node_id,
+                            item=item,
+                            expected_tokens=original_tokens,
+                        )
+                    )
+                else:
+                    template_matches = bool(
+                        parser._direct_command_script_index(original_tokens) == len(invocation_prefix)
+                        and (exact_original or (
+                            len(invocation_prefix) == 1 and not suffix_tokens
+                            and language_tokens & summary_tokens
+                            and normalized_source in normalized_summary
+                        ))
+                    )
+                    if not template_matches and len(invocation_prefix) == 1 and not suffix_tokens:
+                        template_matches = self._grounded_original_invocation(
+                            original_analysis=original_analysis,
+                            node_id=original_instruction_node_id,
+                            item=item,
+                            expected_tokens=original_tokens,
+                        )
                 if template_matches and exact_original:
                     dispatch_commands = self._inline_command_tokens(str(item.metadata.get("instruction_dispatch_block") or ""))
                     expected_commands = {

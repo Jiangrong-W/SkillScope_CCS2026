@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import ast
 import copy
+import hashlib
 import json
 import re
 import shlex
@@ -63,6 +65,12 @@ class InstructionRewriter:
                 item=item,
             )
             self._record_instruction_dispatch(item)
+        else:
+            inline_notes = self._rewrite_literal_inline_read_group(
+                patched_bundle_root=patched_bundle_root, items=[item]
+            )
+            if inline_notes is not None:
+                return inline_notes
 
         llm_notes = self._rewrite_with_llm(
             patched_bundle_root=patched_bundle_root,
@@ -193,6 +201,12 @@ class InstructionRewriter:
                     )
                 )
                 continue
+            inline_notes = self._rewrite_literal_inline_read_group(
+                patched_bundle_root=patched_bundle_root, items=ordered
+            )
+            if inline_notes is not None:
+                notes.extend(inline_notes)
+                continue
             notes.extend(
                 self._rewrite_same_range_group(
                     patched_bundle_root=patched_bundle_root,
@@ -200,6 +214,467 @@ class InstructionRewriter:
                 )
             )
         return notes
+
+    def _rewrite_literal_inline_read_group(
+        self, *, patched_bundle_root: Path, items: list[RepairItem]
+    ) -> list[str] | None:
+        """Project an overlapping command owner/read through one authorized literal read.
+
+        A normalized command owner and its embedded read can cite the same
+        Markdown range. They cannot be split by matching escaped prose, or
+        denied as a whole without losing the computation. This narrow path
+        retains the original command under every original guard and emits a
+        safe command whose decoded body differs only in the task-authorized
+        input literal. All other overlaps still follow the existing refusal.
+        """
+        from skillscope.common.sandbox.tooling import InlineCommandTool
+        from .code_rewriter import PrivilegeSemanticAnalyzer, _task_grounded_read_rebindings
+
+        if not items or any(item.repair_type != "GUARD_INSTRUCTION_TASK_CONDITIONED" for item in items):
+            return None
+        target = self._resolve_instruction_file(patched_bundle_root, items[0])
+        start, end = items[0].source_start_line, items[0].source_end_line
+        if (target is None or start is None or start != end
+                or any(item.source_start_line != start or item.source_end_line != end
+                       or self._resolve_instruction_file(patched_bundle_root, item) != target for item in items)):
+            return None
+        content = target.read_text(encoding="utf-8")
+        lines = content.splitlines(keepends=True)
+        if not 1 <= start <= len(lines):
+            return None
+        line = lines[start - 1]
+        commands = list(re.finditer(r"(?<!`)`([^`\r\n]+)`(?!`)", line))
+        if len(commands) != 1:
+            return None
+        match = commands[0]
+        ungrounded_fragments = set()
+        for item in items:
+            raw = str(item.raw_text or "").strip()
+            if raw == line.strip():
+                continue
+            spans = list(re.finditer(re.escape(raw), line)) if raw else []
+            if (len(spans) != 1 or spans[0].start() < match.start() + 1
+                    or spans[0].end() > match.end() - 1):
+                # A normalized inner action can cite a truncated/case-folded
+                # fragment. It gains no source authority from that fragment;
+                # its own native physical record must recover the exact read.
+                operation = str((item.metadata.get("candidate_semantics") or {}).get("operation_type") or "").casefold()
+                if operation not in {"read", "file_read", "read_file"} or not item.metadata.get("original_execution_witnesses"):
+                    return None
+                ungrounded_fragments.add(item.repair_id)
+        if (not re.fullmatch(r"(?:-\s+)?(?:run|execute)\s+(?:this\s+)?(?:exact\s+)?command(?:\s+once)?\s*:\s*",
+                             line[:match.start()], flags=re.IGNORECASE)
+                or line[match.end():].strip() not in {"", "."}):
+            return None
+        self._assert_dispatch_projection_context(lines=lines, line_index=start - 1)
+        command = match.group(1)
+        decoded = InlineCommandTool()._literal_python_payload(command, patched_bundle_root)
+        if decoded is None:
+            return None
+        tokens, body = decoded
+        tree = ast.parse(body)
+        reads = [node for node in ast.walk(tree) if isinstance(node, ast.Call)
+                 and isinstance(node.func, ast.Attribute) and node.func.attr in {"read_text", "read_bytes"}]
+        if len(reads) != 1:
+            return None
+        read = reads[0]
+        receiver = read.func.value
+        if (not isinstance(receiver, ast.Call) or len(receiver.args) != 1
+                or not isinstance(receiver.args[0], ast.Constant) or not isinstance(receiver.args[0].value, str)):
+            return None
+        resource = receiver.args[0].value
+        read_items, owner_items, prompts = [], [], []
+        physical_read_candidate_evidence = []
+        execution_owners = [item for item in items if str((item.metadata.get("candidate_semantics") or {}).get("operation_type") or "").casefold()
+                            in {"execute", "exec_command", "command_execution"}]
+        for item in items:
+            semantic = item.metadata.get("candidate_semantics") or {}
+            contexts = item.metadata.get("descriptor_contexts")
+            if (not item.guard_condition or not isinstance(contexts, list) or not contexts
+                    or any(not isinstance(context, dict) or context.get("final_verdict") != "overprivileged" for context in contexts)):
+                return None
+            prompts.extend(context.get("task_context", {}).get("intent") for context in contexts)
+            operation = str(semantic.get("operation_type") or "").casefold()
+            if operation in {"read", "file_read", "read_file"} and semantic.get("object_ref") == resource:
+                if item.metadata.get("source_final_verdicts") and not item.metadata.get("original_execution_witnesses"):
+                    return None
+                for context in contexts:
+                    observed_reads = [event for event in context.get("material_action_instances", [])
+                                      if event.get("operation") == "file_read"
+                                      and event.get("source", event.get("object")) == resource
+                                      and event.get("intent") == context.get("task_context", {}).get("intent")
+                                      and event.get("evidence_kind") == "realized_original_action"]
+                    if len(observed_reads) != 1:
+                        return None
+                if item.metadata.get("original_execution_witnesses"):
+                    if len(execution_owners) > 1 or (item.repair_id in ungrounded_fragments and len(execution_owners) != 1):
+                        return None
+                    physical = self._owner_grounded_inline_read(
+                        item=item, command=command, body=body, read=read,
+                        instruction_file=target.relative_to(patched_bundle_root).as_posix(), source_line=start,
+                        resource=resource, execution_owner_id=execution_owners[0].node_id if execution_owners else item.node_id,
+                        necessary_execution_owner=execution_owners[0] if execution_owners else None,
+                    )
+                    if physical is None:
+                        return None
+                    grounded, bindings = physical
+                    physical_read_candidate_evidence.extend(bindings)
+                else:
+                    grounded = copy.deepcopy(item)
+                    grounded.layer = "code"
+                    grounded.source_file = "inline_payload.py"
+                    grounded.source_start_line, grounded.source_end_line = read.lineno, read.end_lineno
+                    grounded.source_start_column, grounded.source_end_column = read.col_offset, read.end_col_offset
+                    grounded.raw_text = ast.get_source_segment(body, read)
+                read_items.append(grounded)
+            elif operation in {"execute", "exec_command", "command_execution"}:
+                # The native tuple may retain a bounded command excerpt. It
+                # must be a prefix of this unique source-grounded command;
+                # ownership alone cannot introduce an unrelated executable.
+                for context in contexts:
+                    prompt = context.get("task_context", {}).get("intent")
+                    executions = [event for event in context.get("material_action_instances", [])
+                                  if event.get("operation") == "exec_command" and event.get("intent") == prompt]
+                    if (len(executions) != 1 or executions[0].get("evidence_kind") != "realized_original_action"
+                            or not isinstance(executions[0].get("object"), str)
+                            or len(executions[0]["object"]) < len(shlex.join(tokens[:3]))
+                            or not command.startswith(executions[0]["object"])):
+                        return None
+                owner_items.append(item)
+            else:
+                return None
+        if any(not isinstance(prompt, str) for prompt in prompts) or len(set(prompts)) != 1:
+            return None
+        owner_read_evidence = []
+        if ungrounded_fragments and (not owner_items or any(not owner.metadata.get("original_execution_witnesses") for owner in owner_items)):
+            return None
+        if ungrounded_fragments and any(
+            item.source_file != target.relative_to(patched_bundle_root).as_posix()
+            or (item.repair_id in ungrounded_fragments and
+                (item.source_start_column is not None or item.source_end_column is not None))
+            for item in items
+        ):
+            # Recovery is limited to a shared physical line with no conflicting
+            # claim to a narrower byte range; it cannot override another file
+            # or an explicit, unverified virtual-action column span.
+            return None
+        if not read_items or any(owner.metadata.get("original_execution_witnesses") for owner in owner_items):
+            # M1 need not extract a separate action for an instrumented inner
+            # read. The owner alone can support its exact literal rebinding,
+            # but only with its own complete original physical execution.
+            for owner in owner_items:
+                derived = self._owner_grounded_inline_read(
+                    item=owner, command=command, body=body, read=read,
+                    instruction_file=target.relative_to(patched_bundle_root).as_posix(),
+                    source_line=start, resource=resource,
+                )
+                if derived is None:
+                    return None
+                grounded, binding = derived
+                read_items.append(grounded)
+                owner_read_evidence.extend(binding)
+        if not read_items:
+            return None
+        safe_bodies, evidence = [], []
+        for grounded in read_items:
+            safe, bindings = _task_grounded_read_rebindings(body, [grounded])
+            if len(bindings) != 1:
+                return None
+            safe_bodies.append(safe)
+            evidence.extend(bindings)
+        if len(set(safe_bodies)) != 1:
+            return None
+        safe_body = safe_bodies[0]
+        proof = PrivilegeSemanticAnalyzer().compare_projection(
+            original_source=body, projected_source=safe_body, suffix=".py", filename="inline_payload.py",
+            blocked_items=[read_items[0]])
+        if (not proof.get("complete")
+                or proof.get("expected_action_semantics") != proof.get("observed_action_semantics")):
+            return None
+        # A command-owner judgment covers the whole command. Do not pretend
+        # that fixing one read proves safety for other reads, writes or effects.
+        required_outputs = []
+        for prompt in prompts:
+            output_matches = re.findall(
+                r"(?:^|[.!?;]\s+|\n)writing\s+([A-Za-z0-9_./-]+\.[A-Za-z0-9_-]+)\s+is\s+required\b",
+                prompt, flags=re.IGNORECASE)
+            if len(output_matches) != 1:
+                return None
+            output = output_matches[0]
+            if (Path(output).is_absolute() or ".." in Path(output).parts
+                    or re.search(r"\b(?:do\s+not|never|must\s+not)\s+(?:write|save|create)\s+(?:to\s+)?[\"'`]?"
+                                 + re.escape(output) + r"(?:[\"'`]|\b)", prompt, flags=re.IGNORECASE)):
+                return None
+            required_outputs.append(output)
+        if len(set(required_outputs)) != 1:
+            return None
+        allowed_input = str(evidence[0]["authorized_resource"])
+        if len(proof.get("expected_privilege_semantics", [])) != 2:
+            return None
+        privilege_operations = {value.get("operation") for value in proof.get("expected_privilege_semantics", [])}
+        for privilege in proof.get("expected_privilege_semantics", []):
+            if privilege.get("operation") not in {"file_access", "file_read", "file_write"}:
+                return None
+        # Code graphs retain the complete literal Path expression as object
+        # identity. Inspect the exact call, not a substring/basename of that
+        # expression, and reject other operations on even an authorized path.
+        for action in proof.get("expected_action_semantics", []):
+            if action.get("operation") not in privilege_operations:
+                continue
+            try:
+                call = ast.parse(str(action.get("expression") or ""), mode="eval").body
+            except SyntaxError:
+                return None
+            if not isinstance(call, ast.Call) or not isinstance(call.func, ast.Attribute):
+                return None
+            path_call = call.func.value
+            if (not isinstance(path_call, ast.Call) or len(path_call.args) != 1 or path_call.keywords
+                    or ast.dump(path_call.func) != ast.dump(receiver.func)
+                    or not isinstance(path_call.args[0], ast.Constant)
+                    or not isinstance(path_call.args[0].value, str)):
+                return None
+            if not ((call.func.attr in {"read_text", "read_bytes"} and path_call.args[0].value == allowed_input)
+                    or (call.func.attr in {"write_text", "write_bytes"} and path_call.args[0].value == required_outputs[0])):
+                return None
+        resource_path = patched_bundle_root / allowed_input
+        path_parts = [resource_path]
+        parent = resource_path.parent
+        while parent != patched_bundle_root and parent != parent.parent:
+            path_parts.append(parent)
+            parent = parent.parent
+        if not resource_path.is_file() or patched_bundle_root.is_symlink() or any(part.is_symlink() for part in path_parts):
+            raise RuntimeError("instruction projection failed closed: task-authorized input is absent or symbolic")
+        safe_tokens = [*tokens[:3], "exec(" + json.dumps(safe_body, ensure_ascii=False) + ")"]
+        safe_command = shlex.join(safe_tokens)
+        if InlineCommandTool()._literal_python_payload(safe_command, patched_bundle_root) != (safe_tokens, safe_body):
+            return None
+        guards = [str(item.guard_condition) for item in items]
+        replacement = [
+            "- Evaluate each following condition semantically before running exactly one command; missing or ambiguous context is false.\n",
+            *[f"- Action {index}: {guard}\n" for index, guard in enumerate(guards, 1)],
+            "- If and only if all of these action conditions authorize and require the original command, run "
+            f"`{command}`.\n",
+            "- Otherwise, including blocked, missing, ambiguous, or unmatched requests, run "
+            f"`{safe_command}`.\n",
+        ]
+        lines[start - 1:start] = replacement
+        target.write_text(self._ensure_trailing_newline("".join(lines)), encoding="utf-8")
+        shared = {"original_command": command, "safe_command": safe_command,
+                  "original_command_sha256": hashlib.sha256(command.encode()).hexdigest(),
+                  "safe_command_sha256": hashlib.sha256(safe_command.encode()).hexdigest(),
+                  "original_body_sha256": hashlib.sha256(body.encode()).hexdigest(),
+                  "safe_body_sha256": hashlib.sha256(safe_body.encode()).hexdigest(),
+                  "task_grounded_read_rebindings": evidence, "semantic_projection": proof,
+                  "read_repair_ids": [item.repair_id for item in read_items
+                                      if not item.metadata.get("derived_from_execution_owner")],
+                  "owner_derived_read_evidence": owner_read_evidence,
+                  "physical_read_candidate_evidence": physical_read_candidate_evidence,
+                  "physically_recovered_fragment_repair_ids": sorted(ungrounded_fragments),
+                  "owner_repair_ids": [item.repair_id for item in owner_items],
+                  "guard_conditions": guards, "instruction_file": target.relative_to(patched_bundle_root).as_posix(),
+                  "original_source_line": start, "original_source_fragment": line.rstrip("\r\n")}
+        for item in items:
+            item.metadata.update(instruction_projection_strategy="fallback_literal_inline_authorized_read",
+                                 instruction_projection_scope="grounded_inline_command",
+                                 instruction_projection_fragment=line.rstrip("\r\n"),
+                                 instruction_projection_group_repair_ids=[peer.repair_id for peer in items],
+                                 inline_read_projection=copy.deepcopy(shared))
+        return [f"Projected one literal inline command with task-authorized input for {', '.join(item.repair_id for item in items)}."]
+
+    @staticmethod
+    def _owner_grounded_inline_read(
+        *, item: RepairItem, command: str, body: str, read: ast.Call,
+        instruction_file: str, source_line: int, resource: str, execution_owner_id: str | None = None,
+        necessary_execution_owner: RepairItem | None = None,
+    ) -> tuple[RepairItem, list[dict[str, Any]]] | None:
+        """Bind a literal inner read to the owner's original native tool call.
+
+        The supplemental records come from the planner's exact original
+        replay/trigger join. They contain no execution metadata or answers.
+        No unobserved source operation, descriptor prose, or fixture can
+        replace a completed, instrumented physical operation here.
+        """
+        contexts = item.metadata.get("descriptor_contexts", [])
+        witnesses = item.metadata.get("original_execution_witnesses")
+        verdicts = item.metadata.get("source_final_verdicts")
+        candidate_id = item.metadata.get("source_candidate_id")
+        execution_owner_id = execution_owner_id or item.node_id
+        if not isinstance(witnesses, list) or not isinstance(verdicts, list) or not candidate_id:
+            return None
+        if item.source_file != instruction_file:
+            return None
+        necessary_owner_binding = None
+        if necessary_execution_owner is not None:
+            owner = necessary_execution_owner
+            operation = str((owner.metadata.get("candidate_semantics") or {}).get("operation_type") or "").casefold()
+            if (operation not in {"execute", "exec_command", "command_execution"}
+                    or owner.node_id != execution_owner_id or owner.node_id == item.node_id
+                    or owner.source_file != item.source_file
+                    or owner.source_start_line != item.source_start_line or owner.source_end_line != item.source_end_line):
+                return None
+            necessary_owner_binding = InstructionRewriter._owner_grounded_inline_read(
+                item=owner, command=command, body=body, read=read,
+                instruction_file=instruction_file, source_line=source_line, resource=resource,
+            )
+            if necessary_owner_binding is None:
+                return None
+            owner_prompts = {context.get("task_context", {}).get("intent")
+                             for context in owner.metadata.get("descriptor_contexts", [])}
+            if owner_prompts != {context.get("task_context", {}).get("intent") for context in contexts}:
+                return None
+        if any(isinstance(node, (ast.Try, ast.TryStar, ast.With, ast.AsyncWith)) for node in ast.walk(ast.parse(body))):
+            # The operation hook observes an attempted open. A caught failure
+            # or suppressing context manager cannot certify a successful read.
+            return None
+        command_sha = hashlib.sha256(command.encode()).hexdigest()
+        body_sha = hashlib.sha256(body.encode()).hexdigest()
+        derived_contexts, bindings = [], []
+        material_types = {"file_read", "file_write", "file_delete", "file_unlink", "network_request",
+                          "network_send", "http_request", "process_spawn", "exec_command"}
+        for context in contexts:
+            task_id = context.get("task_id")
+            prompt = context.get("task_context", {}).get("intent")
+            native = [value for value in verdicts if value.get("candidate_id") == candidate_id
+                      and value.get("task_id") == task_id]
+            matched = [value for value in witnesses if value.get("candidate_id") == candidate_id
+                       and value.get("task_id") == task_id and value.get("node_id") == item.node_id]
+            if (context.get("candidate_id") != candidate_id or not task_id
+                    or len(native) != 1 or native[0].get("label") != "overprivileged"
+                    or native[0].get("authorization_label") != "unauthorized"
+                    or native[0].get("necessity_label") not in {"necessary", "inconclusive"}
+                    or (native[0].get("necessity_label") != "necessary" and necessary_owner_binding is None)
+                    or len(matched) != 1):
+                return None
+            witness = matched[0]
+            record = witness.get("record", {})
+            trace = record.get("trace")
+            if (set(record) != {"run_id", "status", "prompt", "trace"}
+                    or record.get("status") != "completed" or record.get("prompt") != prompt
+                    or not record.get("run_id") or record.get("run_id") != witness.get("execution_run_id")
+                    or not isinstance(trace, list) or any(not isinstance(event, dict) for event in trace)
+                    or any(event.get("attributes", {}).get("trace_truncated") is True for event in trace)):
+                return None
+            starts = [(index, event) for index, event in enumerate(trace)
+                      if event.get("event_type") == "tool_call_start" and event.get("node_id") == execution_owner_id
+                      and event.get("attributes", {}).get("instruction_node_id") == execution_owner_id
+                      and event.get("attributes", {}).get("tool_name") == "inline_command"]
+            if len(starts) != 1:
+                return None
+            start_index, start_event = starts[0]
+            call_id = start_event.get("attributes", {}).get("tool_call_id")
+            if not isinstance(call_id, str) or not call_id:
+                return None
+            call = [(index, event) for index, event in enumerate(trace)
+                    if event.get("attributes", {}).get("tool_call_id") == call_id]
+            def events(kind):
+                return [(index, event) for index, event in call if event.get("event_type") == kind]
+            kinds = {kind: events(kind) for kind in ("exec_command", "script_start", "file_read", "script_end", "tool_call_end")}
+            if any(len(values) != 1 for values in kinds.values()):
+                return None
+            prefix_index, prefix = kinds["exec_command"][0]
+            script_index, script = kinds["script_start"][0]
+            read_index, actual_read = kinds["file_read"][0]
+            script_end_index, script_end = kinds["script_end"][0]
+            end_index, end = kinds["tool_call_end"][0]
+            if (not start_index < prefix_index < script_index < read_index < script_end_index < end_index
+                    or end.get("node_id") != execution_owner_id or end.get("object_ref") != start_event.get("object_ref")
+                    or end.get("attributes", {}).get("instruction_node_id") != execution_owner_id
+                    or end.get("attributes", {}).get("tool_name") != "inline_command"
+                    or end.get("attributes", {}).get("status") != "completed"
+                    or script_end.get("attributes", {}).get("status") != "completed"
+                    or prefix.get("attributes", {}).get("runtime_command") != command
+                    or prefix.get("attributes", {}).get("runtime_command_tokens") != shlex.split(command)
+                    or prefix.get("object_ref") != shlex.split(command)[0]
+                    or prefix.get("attributes", {}).get("runtime_evidence") != "python_instrumented_inline_command_start"
+                    or prefix.get("attributes", {}).get("temporal_order_observed") is not True
+                    or prefix.get("attributes", {}).get("execution_count_observed") is not True
+                    or actual_read.get("object_ref") != resource):
+                return None
+            if any(event.get("event_type") in {"tool_call_error", "script_error"}
+                   or (event.get("event_type") in material_types and event.get("event_type") not in {"exec_command", "file_read", "file_write"})
+                   for _, event in call):
+                return None
+            material = [(index, event) for index, event in call if event.get("event_type") in material_types]
+            if len([event for _, event in material if event.get("event_type") == "file_write"]) != 1:
+                return None
+            # A nested or competing call cannot supply this owner's read.
+            if any(event.get("event_type") == "tool_call_start" and index != start_index
+                   for index, event in enumerate(trace) if start_index <= index <= end_index):
+                return None
+            script_file = script.get("attributes", {}).get("source_file")
+            if (not script_file or script_end.get("attributes", {}).get("source_file") != script_file
+                    or script.get("object_ref") != script_file or script_end.get("object_ref") != script_file
+                    or script.get("attributes", {}).get("script_relative_path") != script_file
+                    or script_end.get("attributes", {}).get("script_relative_path", script_file) != script_file):
+                return None
+            for _, event in [*material, (script_index, script), (script_end_index, script_end)]:
+                attributes = event.get("attributes", {})
+                source_range = attributes.get("instruction_source_range", {})
+                if (attributes.get("instruction_node_id") != execution_owner_id
+                        or attributes.get("tool_name") != "inline_command"
+                        or attributes.get("instruction_source_file") != instruction_file
+                        or source_range.get("start_line") != source_line or source_range.get("end_line") != source_line
+                        or attributes.get("instruction_command_sha256") != command_sha
+                        or attributes.get("inline_python_body_sha256") != body_sha
+                        or attributes.get("inline_python_instrumented") is not True
+                        or attributes.get("inline_instruction_command") is not True
+                        or any(attributes.get(key) is True for key in ("blocked", "ablated", "disabled", "simulated"))
+                        or attributes.get("trace_truncated") is True
+                        or (event.get("event_type") in material_types and attributes.get("material") is False)
+                        or attributes.get("trace_granularity") != "instrumented_python"):
+                    return None
+                if event.get("event_type") in {"file_read", "file_write"} and (
+                    attributes.get("source_file") != script_file
+                    or attributes.get("runtime_evidence") != "python_instrumented_operation"
+                    or attributes.get("temporal_order_observed") is not True
+                    or attributes.get("execution_count_observed") is not True):
+                    return None
+            attributes = actual_read.get("attributes", {})
+            if any(attributes.get(key) != value for key, value in {
+                "source_start_line": read.lineno, "source_end_line": read.end_lineno,
+                "source_start_column": read.col_offset, "source_end_column": read.end_col_offset,
+            }.items()):
+                return None
+            derived_context = copy.deepcopy(context)
+            derived_context["material_action_instances"] = [{
+                "intent": prompt, "operation": "file_read", "object": resource, "source": resource,
+                "evidence_kind": "realized_original_action",
+                "derived_from_execution_owner": execution_owner_id == item.node_id,
+                "physical_execution_owner_node_id": execution_owner_id,
+            }]
+            derived_contexts.append(derived_context)
+            bindings.append({"repair_id": item.repair_id,
+                "owner_repair_id": item.repair_id if execution_owner_id == item.node_id else None,
+                "candidate_id": candidate_id, "candidate_node_id": item.node_id,
+                "execution_owner_node_id": execution_owner_id,
+                "candidate_necessity_label": native[0]["necessity_label"],
+                "computation_preservation_basis": (
+                    {"strategy": "independently_confirmed_necessary_execution_owner",
+                     "owner_candidate_id": necessary_execution_owner.metadata.get("source_candidate_id"),
+                     "owner_repair_id": necessary_execution_owner.repair_id,
+                     "owner_physical_bindings": copy.deepcopy(necessary_owner_binding[1])}
+                    if necessary_owner_binding is not None else
+                    {"strategy": "original_native_candidate_necessary"}
+                ),
+                "task_id": task_id, "execution_run_id": record["run_id"], "tool_call_id": call_id,
+                "tool_call_start_index": start_index, "exec_command_index": prefix_index,
+                "file_read_index": read_index, "script_end_index": script_end_index,
+                "tool_call_end_index": end_index, "read_source": resource,
+                "instruction_command_sha256": command_sha, "inline_python_body_sha256": body_sha,
+                "strategy": "native_unauthorized_necessary_owner_same_completed_call_literal_read"})
+        if not derived_contexts:
+            return None
+        grounded = copy.deepcopy(item)
+        grounded.layer = "code"
+        grounded.source_file = "inline_payload.py"
+        grounded.source_start_line, grounded.source_end_line = read.lineno, read.end_lineno
+        grounded.source_start_column, grounded.source_end_column = read.col_offset, read.end_col_offset
+        grounded.raw_text = ast.get_source_segment(body, read)
+        operation = str((item.metadata.get("candidate_semantics") or {}).get("operation_type") or "").casefold()
+        grounded.metadata.update(derived_from_execution_owner=operation in {"execute", "exec_command", "command_execution"},
+                                 descriptor_contexts=derived_contexts,
+                                 candidate_semantics={"operation_type": "read", "object_ref": resource})
+        return grounded, bindings
 
     def _rewrite_same_range_group(
         self,
@@ -1042,7 +1517,8 @@ class InstructionRewriter:
             "source_end_line": item.source_end_line,
             "raw_text": item.raw_text,
             "generated_files": item.generated_files,
-            "metadata": item.metadata,
+            "metadata": {key: value for key, value in item.metadata.items()
+                         if key != "original_execution_witnesses"},
         }
 
     def _replacement_lines(self, item: RepairItem) -> list[str]:
@@ -1265,7 +1741,7 @@ class InstructionRewriter:
         content: str,
         item: RepairItem,
     ) -> dict[str, object]:
-        """Locate an executable command, never a filename mention.
+        """Locate a grounded command or explicitly executable local script link.
 
         A source token must occupy the script position in one supported direct
         command and appear in an explicit invocation sentence.  Independent
@@ -1311,10 +1787,97 @@ class InstructionRewriter:
                     "tokens": tokens,
                     "source_index": source_index,
                 })
+            try:
+                self._assert_dispatch_projection_context(lines=lines, line_index=line_index)
+            except RuntimeError:
+                continue
+            link_invocation = self._markdown_script_invocation(line=line, source_file=source_file)
+            if link_invocation is not None:
+                if inline_commands:
+                    raise RuntimeError(
+                        "instruction dispatch projection failed closed: multiple "
+                        "executable commands share the invocation line"
+                    )
+                matches.append({"line_number": line_index + 1, **link_invocation})
         if len(matches) != 1:
             reason = "no grounded executable invocation" if not matches else "multiple grounded executable invocations"
             raise RuntimeError(f"instruction dispatch projection failed closed: {reason} for {source_file}")
         return matches[0]
+
+    def _markdown_script_invocation(
+        self,
+        *,
+        line: str,
+        source_file: str,
+    ) -> dict[str, object] | None:
+        # A link alone denotes a resource. Only a direct imperative or an
+        # unambiguous subsequent "run it using Python" makes it an entrypoint.
+        code_spans = list(re.finditer(r"(?<!`)(`+)(?!`)[^\r\n]*?(?<!`)\1(?!`)", line))
+        links = [
+            match for match in re.finditer(r"(?<!!)\[[^\]\r\n]+\]\(([^()\s]+)\)", line)
+            if not any(span.start() <= match.start() < span.end() for span in code_spans)
+        ]
+        script_links = []
+        script_reference_count = 0
+        for match in links:
+            destination = match.group(1)
+            path = Path(destination)
+            if Path(destination.split("?", 1)[0].split("#", 1)[0]).suffix.casefold() == ".py":
+                script_reference_count += 1
+            if (
+                path.suffix.casefold() != ".py"
+                or path.is_absolute()
+                or ".." in path.parts
+                or any(character in destination for character in "\\:%?#")
+            ):
+                continue
+            script_links.append((match, destination))
+        matching = [
+            (match, destination)
+            for match, destination in script_links
+            if self._source_token_index(tokens=["python3", destination], source_file=source_file) == 1
+        ]
+        if not matching:
+            return None
+        match, destination = matching[0]
+        if re.search(
+            r"\b(?:reference|documentation|example|illustration|sample)\b"
+            r"|\b(?:do\s+not|don't|never|must\s+not|not\s+to)\b"
+            r"[^.!?;\r\n]*?\b(?:run|execute|invoke|launch)\b",
+            line,
+            re.IGNORECASE,
+        ):
+            return None
+        direct = re.search(
+            r"\b(?:run|execute|invoke|launch)\s*$", line[:match.start()], re.IGNORECASE
+        )
+        anaphoric = re.search(
+            r"(?:^|[.!?;]\s+)(?:run|execute|invoke|launch)\s+"
+            r"(?:it|(?:this|the)(?:\s+linked)?\s+(?:script|helper))\b"
+            r"[^.!?;\r\n]*?\b(?:using|with)\s+(?:python(?:\s+3(?:\.\d+)*)?|python3)\b",
+            line[match.end():],
+            re.IGNORECASE,
+        )
+        if direct is None and anaphoric is None:
+            return None
+        if re.search(
+            r"\b(?:using|with)\s+(?:node|bun|ruby|perl|bash|sh|pwsh|powershell|pypy)\b",
+            line[match.end():],
+            re.IGNORECASE,
+        ):
+            # The inferred Python launcher must not override an explicit
+            # conflicting runtime in the source instruction.
+            return None
+        if script_reference_count != 1 or (direct is None and len(links) != 1):
+            raise RuntimeError(
+                "instruction dispatch projection failed closed: ambiguous "
+                "local script links on the invocation line"
+            )
+        return {
+            "start_column": match.start(), "end_column": match.end(),
+            "matched_text": match.group(0), "tokens": ["python3", destination],
+            "source_index": 1,
+        }
 
     def _assert_dispatch_projection_context(
         self,

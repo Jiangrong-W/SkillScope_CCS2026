@@ -29,6 +29,145 @@ from skillscope.module2_action_necessity_validation.candidate_ablation import (
 )
 
 
+def _explicit_read_only_resource(prompt: str) -> str | None:
+    """Recover one literal local resource from an explicit task read boundary."""
+    resources = []
+    for match in re.finditer(
+        r"(?:^|[.!?;]\s+|\n)(?:please\s+)?read\s+only\s+([^\r\n]*?)(?=[.!?](?:\s|$)|\n|$)",
+        prompt,
+        re.IGNORECASE,
+    ):
+        clause = re.split(r"[.!?](?:\s|$)|;\s*(?=(?:write|writing|save|saving|print|return|do\s+not)\b)",
+                          match.group(1), maxsplit=1, flags=re.IGNORECASE)[0]
+        first = re.match(r"(?:`([^`]+)`|\"([^\"]+)\"|'([^']+)'|([^\s,;]+))", clause)
+        if first is None:
+            return None
+        resource = next(value for value in first.groups() if value is not None).rstrip('.')
+        path = PurePosixPath(resource)
+        if (not resource or path.is_absolute() or '..' in path.parts or not path.suffix
+                or any(character in resource for character in '\\:%?#~\x00')
+                or path.suffix.casefold() in {'.py', '.sh', '.js', '.ts'}):
+            return None
+        # A second named data source leaves its role ambiguous. Do not pick
+        # the first member of a list, or a source inferred only by basename.
+        mentioned = re.findall(r"[A-Za-z0-9_./-]+\.[A-Za-z0-9_-]+", clause)
+        if len(mentioned) != 1 or mentioned[0].removeprefix('./') != resource.removeprefix('./'):
+            return None
+        resources.append(resource)
+    if not resources or len(set(resources)) != 1:
+        return None
+    for match in re.finditer(r"\b(?:do\s+not|don't|never|must\s+not)\s+read\s+([^\r\n]*?)(?=[.!?](?:\s|$)|\n|$)", prompt, re.IGNORECASE):
+        clause = re.split(r"[.!?](?:\s|$)", match.group(1), maxsplit=1)[0]
+        forbidden = re.findall(r"[A-Za-z0-9_./-]+\.[A-Za-z0-9_-]+", clause)
+        if resources[0].removeprefix('./') in {value.removeprefix('./') for value in forbidden}:
+            return None
+    return resources[0]
+
+
+def _task_grounded_read_rebindings(
+    source: str,
+    items: list[RepairItem],
+) -> tuple[str, list[dict[str, object]]]:
+    """Rebind only an exact pathlib read to every blocked task's unique source.
+
+    This derives an alternative from native descriptor task intent and its
+    realized read tuple. It neither supplies result values nor accepts an LLM
+    invented resource. The complete original computation stays byte-for-byte
+    intact outside that read's literal receiver argument.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return source, []
+    path_names, module_names = set(), set()
+    for node in tree.body:
+        if isinstance(node, ast.ImportFrom) and node.module == 'pathlib':
+            path_names.update(alias.asname or alias.name for alias in node.names if alias.name == 'Path')
+        elif isinstance(node, ast.Import):
+            module_names.update(alias.asname or alias.name for alias in node.names if alias.name == 'pathlib')
+    bindings = path_names | module_names
+    # A reassignment/parameter can change a trusted pathlib binding. Unknown
+    # receivers, open(), multi-part paths and dynamic values retain the old
+    # refusal/neutralization behavior.
+    imported_names = []
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            if isinstance(node, ast.ImportFrom) and any(alias.name == '*' for alias in node.names):
+                return source, []
+            imported_names.extend(alias.asname or alias.name.split('.')[0] for alias in node.names)
+    shadowed = any(imported_names.count(name) != 1 for name in bindings) or any(
+                   (isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store) and node.id in bindings)
+                   or (isinstance(node, ast.arg) and node.arg in bindings)
+                   or (isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name in bindings)
+                   or (isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Store)
+                       and isinstance(node.value, ast.Name) and node.value.id in bindings)
+                   for node in ast.walk(tree))
+    if shadowed:
+        return source, []
+    encoded = source.encode('utf-8')
+    lines = encoded.splitlines(keepends=True)
+    offsets = [0]
+    for line in lines:
+        offsets.append(offsets[-1] + len(line))
+    replacements = []
+    evidence = []
+    for item in items:
+        if item.source_start_line is None or item.source_end_line is None:
+            continue
+        matcher = _PythonRepairTransformer(start_line=item.source_start_line, end_line=item.source_end_line,
+            start_column=item.source_start_column, end_column=item.source_end_column, raw_text=item.raw_text)
+        matches = [node for node in ast.walk(tree) if matcher._matches_target_call(node)]
+        if len(matches) != 1:
+            continue
+        call = matches[0]
+        if not isinstance(call.func, ast.Attribute) or call.func.attr not in {'read_text', 'read_bytes'}:
+            continue
+        receiver = call.func.value
+        if not isinstance(receiver, ast.Call) or len(receiver.args) != 1 or receiver.keywords:
+            continue
+        constructor = receiver.func
+        trusted = (isinstance(constructor, ast.Name) and constructor.id in path_names) or (
+            isinstance(constructor, ast.Attribute) and constructor.attr == 'Path'
+            and isinstance(constructor.value, ast.Name) and constructor.value.id in module_names)
+        literal = receiver.args[0]
+        if not trusted or not isinstance(literal, ast.Constant) or not isinstance(literal.value, str):
+            continue
+        contexts = item.metadata.get('descriptor_contexts')
+        if not isinstance(contexts, list) or not contexts:
+            continue
+        sources, prompts = [], []
+        for context in contexts:
+            if context.get('final_verdict') != 'overprivileged':
+                continue
+            prompt = context.get('task_context', {}).get('intent')
+            material = context.get('material_action_instances', [])
+            if (not isinstance(prompt, str) or not any(
+                instance.get('operation') == 'file_read'
+                and instance.get('source', instance.get('object')) == literal.value
+                and instance.get('intent') == prompt for instance in material)):
+                sources = []
+                break
+            alternative = _explicit_read_only_resource(prompt)
+            if alternative is None or str(PurePosixPath(alternative)) == str(PurePosixPath(literal.value)):
+                sources = []
+                break
+            sources.append(alternative)
+            prompts.append(hashlib.sha256(prompt.encode('utf-8')).hexdigest())
+        if not sources or len(set(sources)) != 1:
+            continue
+        begin = offsets[literal.lineno - 1] + literal.col_offset
+        end = offsets[literal.end_lineno - 1] + literal.end_col_offset
+        replacements.append((begin, end, repr(sources[0]).encode('utf-8')))
+        evidence.append({'repair_id': item.repair_id, 'original_resource': literal.value,
+                         'authorized_resource': sources[0], 'task_prompt_sha256': sorted(set(prompts)),
+                         'strategy': 'unique_explicit_native_task_read_boundary'})
+    if len({(start, end) for start, end, _ in replacements}) != len(replacements):
+        return source, []
+    for start, end, replacement in sorted(replacements, reverse=True):
+        encoded = encoded[:start] + replacement + encoded[end:]
+    return encoded.decode('utf-8'), evidence
+
+
 class PrivilegeSemanticAnalyzer:
     """Prove that a projected unit removes actions, not only source text.
 
@@ -88,6 +227,12 @@ class PrivilegeSemanticAnalyzer:
                 "raw_targets_absent": False,
             }
 
+        rebound_source, rebound_reads = (_task_grounded_read_rebindings(original_source, blocked_items)
+                                        if suffix.casefold() == '.py' else (original_source, []))
+        expected_original = self._analyze(rebound_source, suffix, filename) if rebound_reads else original
+        rebound_ids = {entry['repair_id'] for entry in rebound_reads}
+        if expected_original is None or len(expected_original['actions']) != len(original['actions']):
+            expected_original, rebound_reads, rebound_ids = original, [], set()
         blocked_indices: set[int] = set()
         target_action_semantics: list[dict[str, str]] = []
         target_privilege_semantics: list[dict[str, str]] = []
@@ -101,7 +246,8 @@ class PrivilegeSemanticAnalyzer:
                 original["actions"],
                 matches,
             )
-            blocked_indices.update(grounded_matches)
+            if item.repair_id not in rebound_ids:
+                blocked_indices.update(grounded_matches)
             for index in sorted(grounded_matches):
                 entry = original["actions"][index]
                 target_action_semantics.append(dict(entry["action_semantics"]))
@@ -111,7 +257,7 @@ class PrivilegeSemanticAnalyzer:
 
         expected_actions = [
             dict(entry["action_semantics"])
-            for index, entry in enumerate(original["actions"])
+            for index, entry in enumerate(expected_original["actions"])
             if index not in blocked_indices
         ]
         observed_actions = [
@@ -124,7 +270,7 @@ class PrivilegeSemanticAnalyzer:
         ]
         expected_privilege = [
             dict(entry["privilege_semantics"])
-            for index, entry in enumerate(original["actions"])
+            for index, entry in enumerate(expected_original["actions"])
             if index not in blocked_indices
             and isinstance(entry.get("privilege_semantics"), dict)
         ]
@@ -177,8 +323,10 @@ class PrivilegeSemanticAnalyzer:
             "complete": complete,
             "analysis_complete": True,
             "reason": (
-                "the projected action graph exactly matches the original "
-                "graph with the blocked target actions removed"
+                ("the projected action graph matches the original with exact "
+                 "task-authorized read-source rebindings and blocked actions removed"
+                 if rebound_reads else "the projected action graph exactly matches the original "
+                 "graph with the blocked target actions removed")
                 if complete
                 else "the projected unit contains missing, residual, or new "
                 "actions relative to the grounded static projection"
@@ -198,6 +346,7 @@ class PrivilegeSemanticAnalyzer:
             "action_multiset_matches": action_multiset_matches,
             "privilege_multiset_matches": privilege_multiset_matches,
             "raw_targets_absent": raw_targets_absent,
+            "task_grounded_read_rebindings": rebound_reads,
         }
 
     def semantics_for_graph_nodes(
@@ -559,6 +708,17 @@ class CodeRewriter:
                 for item in repair_items
             ]
 
+        _, read_rebindings = (_task_grounded_read_rebindings(source_path.read_text(encoding='utf-8'), repair_items)
+                              if source_path.suffix.casefold() == '.py' else ('', []))
+        for evidence in read_rebindings:
+            resource = patched_bundle_root / str(evidence['authorized_resource'])
+            parts = PurePosixPath(str(evidence['authorized_resource'])).parts
+            if (not resource.is_file() or any(patched_bundle_root.joinpath(*parts[:index]).is_symlink()
+                                             for index in range(1, len(parts) + 1))):
+                raise RuntimeError('task-grounded read projection failed closed: authorized alternative resource is unavailable or symlinked')
+            item = next(item for item in repair_items if item.repair_id == evidence['repair_id'])
+            item.metadata['task_grounded_read_rebinding'] = evidence
+
         if len(repair_items) > 1:
             return self._materialize_composite_fallback_variants(
                 patched_bundle_root=patched_bundle_root,
@@ -567,6 +727,13 @@ class CodeRewriter:
             )
 
         item = repair_items[0]
+        if read_rebindings:
+            # A data-producing blocked read has an independently grounded
+            # legal path. Preserve its entire computation deterministically
+            # instead of accepting a model-authored empty/default data value.
+            return self._materialize_fallback_variants(
+                patched_bundle_root=patched_bundle_root, source_path=source_path, item=item,
+            )
         llm_notes = self._rewrite_with_llm(
             patched_bundle_root=patched_bundle_root,
             source_path=source_path,
@@ -1205,6 +1372,9 @@ class CodeRewriter:
 
     def _neutralize_source(self, source_text: str, item: RepairItem) -> str:
         if item.source_file and item.source_file.endswith(".py"):
+            rebound, evidence = _task_grounded_read_rebindings(source_text, [item])
+            if evidence:
+                return rebound
             rewritten = self._neutralize_python(source_text, item)
             if rewritten is not None:
                 return rewritten
@@ -1279,12 +1449,24 @@ class CodeRewriter:
             tree = ast.parse(source_text)
         except SyntaxError:
             return None, set()
-        transformer = _PythonCompositeRepairTransformer(items)
+        _, read_rebindings = _task_grounded_read_rebindings(source_text, items)
+        rebound_ids = {entry['repair_id'] for entry in read_rebindings}
+        for evidence in read_rebindings:
+            item = next(item for item in items if item.repair_id == evidence['repair_id'])
+            matcher = _PythonRepairTransformer(start_line=item.source_start_line, end_line=item.source_end_line,
+                start_column=item.source_start_column, end_column=item.source_end_column, raw_text=item.raw_text)
+            for node in ast.walk(tree):
+                if matcher._matches_target_call(node):
+                    node.func.value.args[0].value = evidence['authorized_resource']
+        remaining = [item for item in items if item.repair_id not in rebound_ids]
+        if not remaining:
+            return ast.unparse(tree) + '\n', rebound_ids
+        transformer = _PythonCompositeRepairTransformer(remaining)
         updated_tree = transformer.visit(tree)
-        if not transformer.replaced:
+        if not transformer.replaced and not rebound_ids:
             return None, set()
         ast.fix_missing_locations(updated_tree)
-        return ast.unparse(updated_tree) + "\n", set(transformer.matched_ids)
+        return ast.unparse(updated_tree) + "\n", set(transformer.matched_ids) | rebound_ids
 
     def _neutralize_javascript_typescript(
         self,
@@ -1865,6 +2047,7 @@ class CodeRewriter:
             semantic_status["complete"]
         )
         item.metadata["safe_semantic_proof_reason"] = str(semantic_status["reason"])
+        item.metadata['task_grounded_read_rebindings'] = list(semantic_status.get('task_grounded_read_rebindings', []))
         item.metadata.setdefault("composite_source_repair_ids", [item.repair_id])
         item.metadata.setdefault("composite_source_repair_count", 1)
         item.metadata.setdefault("neutralized_repair_ids", [item.repair_id])

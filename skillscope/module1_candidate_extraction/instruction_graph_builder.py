@@ -17,7 +17,21 @@ from .instruction_semantic_normalizer import (
 LIST_RE = re.compile(r"^\s*(?:[-*+]|\d+\.)\s+(.*)$")
 HEADER_RE = re.compile(r"^(#+)\s+(.*)$")
 COMMAND_RE = re.compile(
-    r"`([^`]+)`|((?:python|python3|bash|sh|node|npx|deno|ts-node)\s+[^\s`]+)"
+    r"`([^`]+)`|((?:python(?:[23](?:\.\d+)?)?|bash|sh|node|npx|deno|ts-node)\s+[^\s`]+)"
+)
+PYTHON_INTERPRETER_RE = re.compile(r"python(?:[23](?:\.\d+)?)?")
+EXECUTION_CUE_RE = re.compile(
+    r"\b(?:run|execute|invoke|use|copy|install|build|compile)\b|运行|执行|调用",
+    re.IGNORECASE,
+)
+NON_EXECUTION_CONTEXT_RE = re.compile(
+    r"\b(?:example|examples|illustrative|demonstration|reference|syntax|snippet)\b|"
+    r"示例|例子|仅供|参考",
+    re.IGNORECASE,
+)
+NEGATED_EXECUTION_RE = re.compile(
+    r"\b(?:do\s+not|don't|never|avoid|must\s+not|should\s+not)\b|不要|不得|禁止",
+    re.IGNORECASE,
 )
 COMMAND_NAMES = frozenset(
     {
@@ -114,6 +128,10 @@ class InstructionGraphBuilder:
             "edge_count": len(graph_spec.edges),
         }
 
+        bindings, unbound = self._source_invocation_bindings(
+            graph_spec.nodes, markdown_blocks, bundle,
+        )
+        graph.metadata["unbound_explicit_invocations"] = unbound
         local_to_global: dict[str, str] = {}
         for index, node_spec in enumerate(graph_spec.nodes, start=1):
             node_id = self._add_instruction_node(
@@ -122,6 +140,7 @@ class InstructionGraphBuilder:
                 node_spec=node_spec,
                 markdown_blocks=markdown_blocks,
                 ordinal=index,
+                invocation_binding=bindings.get(node_spec.local_id),
             )
             local_to_global[node_spec.local_id] = node_id
 
@@ -263,6 +282,7 @@ class InstructionGraphBuilder:
         node_spec: InstructionGraphNodeSpec,
         markdown_blocks: list[MarkdownBlock],
         ordinal: int,
+        invocation_binding: tuple[list[str], list[str], list[MarkdownBlock]] | None = None,
     ) -> str:
         node_id = f"{graph.graph_id}:{ordinal:03d}"
         referenced_blocks = [block for block in markdown_blocks if block.block_id in set(node_spec.block_ids)]
@@ -270,7 +290,14 @@ class InstructionGraphBuilder:
         start_line = min((block.start_line for block in referenced_blocks), default=1)
         end_line = max((block.end_line for block in referenced_blocks), default=start_line)
         raw_text = node_spec.raw_text.strip() or " ".join(block.text for block in referenced_blocks)
-        invoked_scripts, command_invocations = self._extract_invocations(raw_text, bundle)
+        invoked_scripts, command_invocations, invocation_blocks = invocation_binding or ([], [], [])
+        if invocation_blocks and (
+            any(command not in raw_text for command in command_invocations)
+            or any(script not in raw_text for script in invoked_scripts)
+        ):
+            # The normalized excerpt may omit a long command or its quoting.
+            # Only the uniquely assigned source block can supply executable text.
+            raw_text = " ".join(block.text for block in invocation_blocks)
         operation_type = node_spec.operation_type or (
             "instruction_step" if node_spec.node_type == "INSTR_ACTION" else "predicate"
         )
@@ -317,6 +344,7 @@ class InstructionGraphBuilder:
                 ),
                 "invoked_scripts": invoked_scripts,
                 "command_invocations": command_invocations,
+                "invocation_source_block_ids": [block.block_id for block in invocation_blocks],
                 "normalization_strategy": graph.metadata[
                     "graph_synthesis"
                 ]["strategy"],
@@ -465,7 +493,11 @@ class InstructionGraphBuilder:
 
         for match in COMMAND_RE.finditer(text):
             command_text = (match.group(1) or match.group(2) or "").strip()
-            if command_text and self._is_explicit_command(command_text, bundle):
+            if (
+                command_text
+                and self._command_execution_is_affirmative(text, match.start(), match.end())
+                and self._is_explicit_command(command_text, bundle)
+            ):
                 invocations.append(command_text)
 
         for script in bundle.script_files:
@@ -486,10 +518,108 @@ class InstructionGraphBuilder:
                 + r"\))",
                 flags=re.IGNORECASE,
             )
-            if invocation_pattern.search(text):
+            if any(
+                not self._execution_clause_is_negated(self._preceding_execution_clause(text, match.start()))
+                for match in invocation_pattern.finditer(text)
+            ):
                 invoked_scripts.append(script.relative_path)
 
         return sorted(set(invoked_scripts)), invocations
+
+    def _source_invocation_bindings(
+        self,
+        node_specs: list[InstructionGraphNodeSpec],
+        blocks: list[MarkdownBlock],
+        bundle: SkillBundle,
+    ) -> tuple[
+        dict[str, tuple[list[str], list[str], list[MarkdownBlock]]],
+        list[dict[str, object]],
+    ]:
+        bindings: dict[str, tuple[list[str], list[str], list[MarkdownBlock]]] = {}
+        unbound: list[dict[str, object]] = []
+        for block in blocks:
+            if not self._is_execution_block(block):
+                continue
+            scripts, commands = self._extract_invocations(block.text, bundle)
+            if not scripts and not commands:
+                continue
+            actions = [
+                node for node in node_specs
+                if node.node_type == "INSTR_ACTION" and block.block_id in node.block_ids
+            ]
+            owners = [
+                node for node in actions
+                if node.operation_type in {"execute", "exec_command", "run", "invoke", "command_execution"}
+                or self._infer_action_semantics(node.summary)[0] == "execute"
+            ]
+            explicit_owners = [
+                node for node in owners
+                if re.match(r"^(?:run|execute|invoke)\b|^(?:运行|执行|调用)", node.raw_text.strip(), re.IGNORECASE)
+            ]
+            owners = explicit_owners or owners or (actions if len(actions) == 1 else [])
+            assignments: dict[str, tuple[list[str], list[str]]] = {}
+            if len(owners) == 1:
+                assignments[owners[0].local_id] = (scripts, commands)
+            else:
+                for command in commands:
+                    matches = [node for node in owners if command in node.raw_text]
+                    if len(matches) == 1:
+                        assignments.setdefault(matches[0].local_id, ([], []))[1].append(command)
+                for script in scripts:
+                    matches = [node for node in owners if script in node.raw_text]
+                    if len(matches) == 1:
+                        assignments.setdefault(matches[0].local_id, ([], []))[0].append(script)
+            assigned_commands = {command for _, assigned in assignments.values() for command in assigned}
+            assigned_scripts = {script for assigned, _ in assignments.values() for script in assigned}
+            if set(commands) - assigned_commands or set(scripts) - assigned_scripts:
+                unbound.append({
+                    "block_id": block.block_id,
+                    "source_file": block.source_file,
+                    "start_line": block.start_line,
+                    "end_line": block.end_line,
+                    "reason": "execution_node_assignment_ambiguous",
+                    "commands": [command for command in commands if command not in assigned_commands],
+                    "invoked_scripts": [script for script in scripts if script not in assigned_scripts],
+                })
+            for local_id, (assigned_scripts, assigned_commands) in assignments.items():
+                bound_scripts, bound_commands, bound_blocks = bindings.setdefault(local_id, ([], [], []))
+                bound_scripts.extend(script for script in assigned_scripts if script not in bound_scripts)
+                bound_commands.extend(command for command in assigned_commands if command not in bound_commands)
+                bound_blocks.append(block)
+        return bindings, unbound
+
+    def _is_execution_block(self, block: MarkdownBlock) -> bool:
+        if block.block_type not in {"list_item", "paragraph"}:
+            return False
+        # Execution semantics must come from prose, not strings inside a command.
+        prose = COMMAND_RE.sub(" COMMAND ", block.text)
+        if NON_EXECUTION_CONTEXT_RE.search(block.section_title) or NON_EXECUTION_CONTEXT_RE.search(prose):
+            return False
+        return bool(EXECUTION_CUE_RE.search(prose)) or prose.strip(" \t\r\n.,:;") == "COMMAND"
+
+    def _preceding_execution_clause(self, text: str, position: int) -> str:
+        prefix = COMMAND_RE.sub(" COMMAND ", text[:position])
+        return re.split(r"[.;!?]\s+", prefix)[-1]
+
+    def _command_execution_is_affirmative(self, text: str, start: int, end: int) -> bool:
+        clause = self._preceding_execution_clause(text, start)
+        if self._execution_clause_is_negated(clause):
+            return False
+        return bool(EXECUTION_CUE_RE.search(clause)) or text.strip(" \t\r\n.,:;") == text[start:end]
+
+    def _execution_clause_is_negated(self, clause: str) -> bool:
+        # A false condition still has an affirmative execution branch:
+        # "when A holds and B do not hold, run ...". Exclude only that
+        # predicate negation in the conditional prefix, keeping "do not run"
+        # and all other ambiguous negations fail closed.
+        comma = clause.rfind(",")
+        if comma >= 0 and re.match(r"^\s*(?:when|if|unless)\b", clause, re.IGNORECASE):
+            predicate = re.sub(
+                r"\b(?:do\s+not|don't)\s+hold\b", "FALSE_PREDICATE",
+                clause[:comma], flags=re.IGNORECASE,
+            )
+            clause = predicate + clause[comma:]
+        return bool(NEGATED_EXECUTION_RE.search(clause))
 
     def _command_invokes_script(self, command: str, target: str) -> bool:
         try:
@@ -506,7 +636,8 @@ class InstructionGraphBuilder:
             or Path(executable).name == target_name
         ):
             return True
-        if Path(executable).name not in SCRIPT_INTERPRETERS:
+        executable_name = Path(executable).name
+        if executable_name not in SCRIPT_INTERPRETERS and not PYTHON_INTERPRETER_RE.fullmatch(executable_name):
             return False
         for token in tokens[1:]:
             if token.startswith("-"):
@@ -529,13 +660,13 @@ class InstructionGraphBuilder:
         script_names = {
             Path(script.relative_path).name for script in bundle.script_files
         }
-        if executable_name in COMMAND_NAMES or executable_name in script_names:
+        if (
+            executable_name in COMMAND_NAMES
+            or executable_name in script_names
+            or PYTHON_INTERPRETER_RE.fullmatch(executable_name)
+        ):
             return True
         if executable.startswith(("./", "../")):
-            return True
-        if len(tokens) > 1 and any(
-            marker in text for marker in ("&&", "||", ";", "|", ">", "<")
-        ):
             return True
         return False
 
