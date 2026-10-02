@@ -173,7 +173,7 @@ class SandboxedSkillAgent:
                     prompt=prompt,
                 )
             )
-            instruction_plan = instruction_node_ids or (
+            instruction_plan = instruction_node_ids if instruction_node_ids is not None else (
                 plan.node_ids
                 if plan is not None
                 else self._full_instruction_plan(installed_skill)

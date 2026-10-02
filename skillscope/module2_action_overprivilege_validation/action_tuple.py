@@ -10,7 +10,7 @@ from skillscope.common.models import (
     TaskSpec,
     UEGNode,
 )
-from skillscope.common.privilege import MATERIAL_EVENT_TYPES
+from skillscope.common.privilege import MATERIAL_EVENT_TYPES, material_event_matches_operation
 
 
 URL_RE = re.compile(r"https?://[^\s'\"`)>\]]+", re.IGNORECASE)
@@ -109,7 +109,9 @@ class ActionTupleExtractor:
         if original_record is None:
             return [(static_tuple, None)]
 
-        realized_events = self._realized_events(original_record, candidate.node_id)
+        realized_events = self._realized_events(
+            original_record, candidate.node_id, candidate_operation=operation
+        )
         if not realized_events:
             return [(static_tuple, None)]
         return [
@@ -383,6 +385,8 @@ class ActionTupleExtractor:
         self,
         record: ExecutionRecord,
         candidate_node_id: str,
+        *,
+        candidate_operation: str | None = None,
     ) -> list[dict[str, object]]:
         payloads: list[dict[str, object]] = []
         if record.raw_trace:
@@ -402,18 +406,28 @@ class ActionTupleExtractor:
                 }
                 for event in record.trace
             )
-        related = [
-            payload
-            for payload in payloads
-            if (
-                payload.get("node_id") == candidate_node_id
-                or (
-                    isinstance(payload.get("attributes"), dict)
-                    and payload["attributes"].get("instruction_node_id")
-                    == candidate_node_id
-                )
-            )
-        ]
+        related = []
+        for payload in payloads:
+            attributes = payload.get("attributes")
+            if not isinstance(attributes, dict):
+                attributes = {}
+            event_type = str(payload.get("event_type") or "")
+            if event_type in {"call", "return", "line", "candidate_ablated"}:
+                continue
+            exact_match = payload.get("node_id") == candidate_node_id
+            caller_match = attributes.get("instruction_node_id") == candidate_node_id
+            if not exact_match and not caller_match:
+                continue
+            # The caller identity records provenance, not ownership of every
+            # child side effect. A helper invocation remains exec_command;
+            # its file/network operations have independent graph candidates.
+            if candidate_operation and not material_event_matches_operation(
+                candidate_operation, event_type, attributes
+            ):
+                continue
+            if caller_match and not exact_match and not candidate_operation:
+                continue
+            related.append(payload)
         material = [
             payload
             for payload in related
@@ -506,7 +520,7 @@ class ActionTupleExtractor:
             return url_match.group(0)
         if operation in self.EXTERNAL_OPERATIONS:
             return str(node.object_ref or "external_unspecified")
-        if operation in {"write", "delete"}:
+        if operation in {"write", "file_write", "delete"}:
             path_match = PATH_RE.search(text)
             return path_match.group(0) if path_match else str(node.object_ref or "local_filesystem")
         return "none"
@@ -524,7 +538,7 @@ class ActionTupleExtractor:
             if value is not None and str(value).strip():
                 return str(value).strip()
         text = " ".join([str(node.object_ref or ""), str(node.raw_text or ""), node.summary])
-        if operation in {"read", "file_access", "read_env", "collect", "collect_identifier"}:
+        if operation in {"read", "file_read", "file_access", "read_env", "collect", "collect_identifier"}:
             path_match = PATH_RE.search(text)
             return path_match.group(0) if path_match else str(node.object_ref or text[:160])
         data_predecessors: list[str] = []
@@ -544,7 +558,7 @@ class ActionTupleExtractor:
             return source
         if node.object_ref:
             return str(node.object_ref)
-        if operation in {"read", "file_access", "read_env", "collect", "collect_identifier"}:
+        if operation in {"read", "file_read", "file_access", "read_env", "collect", "collect_identifier"}:
             return source
         call_name = node.attributes.get("call_name")
         if call_name:
@@ -570,7 +584,7 @@ class ActionTupleExtractor:
             return "external"
         if any(token in joined for token in ("/etc/", "/var/", "~/.", ".ssh", ".aws")):
             return "system_or_user_global"
-        if operation in {"read", "write", "delete", "file_access"}:
+        if operation in {"read", "file_read", "write", "file_write", "delete", "file_access"}:
             return "local"
         return "task"
 

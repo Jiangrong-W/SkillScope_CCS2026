@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import ast
 import hashlib
 import inspect
 import json
 import re
+import shlex
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +31,7 @@ from skillscope.module2_action_necessity_validation.service import (
 
 from .descriptor_clustering import DescriptorClusterer
 from .code_rewriter import PrivilegeSemanticAnalyzer
+from .instruction_rewriter import InstructionRewriter
 
 
 class RepairValidator:
@@ -145,6 +148,8 @@ class RepairValidator:
                 item=item,
                 record=record,
                 patched_analysis=patched_analysis,
+                original_analysis=original_run.analysis,
+                original_record=original_record,
                 projection_integrity_entry=integrity_by_candidate.get(
                     candidate_id
                 ),
@@ -302,6 +307,14 @@ class RepairValidator:
                     "goal_satisfied_and_projection_integrity_complete"
                 ),
                 "context_skips": context_skips,
+                "core_instruction_coverage_evidence": [
+                    {
+                        "execution_run_id": record.run_id,
+                        "covered_instructions": record.metadata["core_instruction_coverage_evidence"],
+                    }
+                    for record in execution_records
+                    if record.metadata.get("core_instruction_coverage_evidence")
+                ],
                 "skipped_candidate_ids": sorted(skipped_candidate_ids),
                 "target_signature_status": targeted_signature_status,
                 "metric_contract": {
@@ -589,6 +602,8 @@ class RepairValidator:
         record: ExecutionRecord,
         patched_analysis: CandidateExtractionResult,
         projection_integrity_entry: dict[str, object] | None = None,
+        original_analysis: CandidateExtractionResult | None = None,
+        original_record: ExecutionRecord | None = None,
     ) -> bool:
         if record.status != "completed":
             return False
@@ -596,10 +611,20 @@ class RepairValidator:
         covered_code_node_ids = {
             str(value) for value in item.metadata.get("covered_code_node_ids", [])
         }
+        instruction_coverage = self._core_instruction_coverage(
+            item=item,
+            original_analysis=original_analysis,
+            original_record=original_record,
+            patched_record=record,
+            projection_integrity_entry=projection_integrity_entry,
+        )
+        record.metadata["core_instruction_coverage_evidence"] = instruction_coverage
+        covered_instruction_ids = {str(entry["instruction_node_id"]) for entry in instruction_coverage}
         excluded_node_ids = {
             candidate.node_id,
             expected_candidate_id,
             *covered_code_node_ids,
+            *covered_instruction_ids,
         }
         core_node_ids = [
             node_id
@@ -620,6 +645,7 @@ class RepairValidator:
             summary
             for index, summary in enumerate(task.chain_summaries)
             if index != candidate_position
+            and (index >= len(task.chain_node_ids) or task.chain_node_ids[index] not in covered_instruction_ids)
             and self._normalize(summary) != self._normalize(candidate.summary)
             and self._normalize(summary) not in covered_code_summaries
             and not self._is_boundary_summary(summary)
@@ -649,6 +675,166 @@ class RepairValidator:
             )
             for summary in core_summaries
         )
+
+    def _core_instruction_coverage(
+        self,
+        *,
+        item: RepairItem,
+        original_analysis: CandidateExtractionResult | None,
+        original_record: ExecutionRecord | None,
+        patched_record: ExecutionRecord,
+        projection_integrity_entry: dict[str, object] | None,
+    ) -> list[dict[str, object]]:
+        """Exclude only an abstract instruction proven to be this removed write.
+
+        Operation/path identity and CALLS/RETURNS_TO provenance establish the
+        static relation. All original physical writes to that target must bind
+        to the repaired code span and its actual tool invocation, and no such
+        write may occur in the patched trace. An independent instruction write
+        therefore cannot disappear from the required core by sharing a name.
+        """
+
+        integrity = projection_integrity_entry or {}
+        if (
+            item.layer != "code"
+            or original_analysis is None
+            or original_record is None
+            or original_record.status != "completed"
+            or any(integrity.get(key) is not True for key in (
+                "complete", "unit_hashes_valid", "neutralization_complete",
+                "safe_targets_absent", "safe_semantics_valid",
+            ))
+            or item.metadata.get("safe_semantic_proof_complete") is not True
+            or item.repair_id not in item.metadata.get("neutralized_repair_ids", [])
+        ):
+            return []
+        graph = original_analysis.ueg
+        code_node = graph.node_by_id(item.node_id)
+        if (
+            code_node is None or code_node.layer != "code"
+            or code_node.operation_type != "file_write"
+            or code_node.source_file != item.source_file
+            or code_node.raw_text != item.raw_text
+            or code_node.source_range is None
+        ):
+            return []
+        try:
+            expression = ast.parse(item.raw_text or "", mode="eval").body
+        except (SyntaxError, ValueError):
+            return []
+        if not (
+            isinstance(expression, ast.Call) and isinstance(expression.func, ast.Attribute)
+            and expression.func.attr in {"write_text", "write_bytes"}
+        ):
+            return []
+        receiver = expression.func.value
+        target = None
+        if isinstance(receiver, ast.BinOp) and isinstance(receiver.op, ast.Div) and isinstance(receiver.right, ast.Constant):
+            target = receiver.right.value
+        elif isinstance(receiver, ast.Call) and receiver.args and isinstance(receiver.args[0], ast.Constant):
+            target = receiver.args[0].value
+        if not isinstance(target, str) or not target or Path(target).is_absolute() or ".." in Path(target).parts:
+            return []
+        target = self._normalized_relative_path(target)
+        target_semantics = item.metadata.get("target_privilege_semantics")
+        if not (
+            isinstance(target_semantics, list) and target_semantics
+            and all(isinstance(entry, dict) and entry.get("operation") == "file_write"
+                    and entry.get("object") == code_node.object_ref for entry in target_semantics)
+        ):
+            return []
+
+        def target_writes(record: ExecutionRecord) -> list[object] | None:
+            matches = []
+            for event in record.trace:
+                if event.event_type != "file_write":
+                    continue
+                reference = self._normalized_relative_path(str(event.object_ref or ""))
+                if not reference:
+                    return None
+                if reference == target or reference.endswith("/" + target):
+                    matches.append(event)
+            return matches
+
+        original_writes = target_writes(original_record)
+        patched_writes = target_writes(patched_record)
+        if not original_writes or patched_writes is None or patched_writes:
+            return []
+        code_range = code_node.source_range
+        bound_calls = []
+        for event in original_writes:
+            attributes = event.attributes
+            if (
+                event.node_id != item.node_id
+                or attributes.get("source_file") != item.source_file
+                or any(attributes.get(key) != expected for key, expected in (
+                    ("source_start_line", code_range.start_line),
+                    ("source_end_line", code_range.end_line),
+                    ("source_start_column", code_range.start_column),
+                    ("source_end_column", code_range.end_column),
+                ))
+                or not attributes.get("tool_call_id")
+            ):
+                return []
+            invocation_id = str(attributes.get("instruction_node_id") or "")
+            tool_call_id = str(attributes["tool_call_id"])
+            if not any(
+                e.event_type == "tool_call_start"
+                and e.attributes.get("tool_call_id") == tool_call_id
+                and self._normalized_relative_path(str(e.object_ref or "")) == self._normalized_relative_path(str(item.source_file))
+                for e in original_record.trace
+            ):
+                return []
+            entries = [edge.target for edge in graph.edges if edge.edge_type == "CALLS" and edge.source == invocation_id
+                       and (node := graph.node_by_id(edge.target)) is not None and node.source_file == item.source_file]
+            if not entries:
+                return []
+            reachable = set(entries)
+            queue = list(entries)
+            while queue:
+                current = queue.pop(0)
+                for edge in graph.edges:
+                    if edge.source != current:
+                        continue
+                    node = graph.node_by_id(edge.target)
+                    if node is not None and node.source_file == item.source_file and edge.target not in reachable:
+                        reachable.add(edge.target)
+                        queue.append(edge.target)
+            if item.node_id not in reachable:
+                return []
+            bound_calls.append({"instruction_node_id": invocation_id, "tool_call_id": tool_call_id})
+
+        covered = []
+        for node in graph.nodes:
+            if node.layer != "instruction" or node.operation_type not in {"write", "file_write"}:
+                continue
+            objects = re.findall(r"`([^`]+)`", str(node.object_ref or ""))
+            if len(objects) != 1 or self._normalized_relative_path(objects[0]) != target:
+                continue
+            return_edges = [edge for edge in graph.edges if edge.edge_type == "RETURNS_TO" and edge.target == node.node_id
+                            and edge.attributes.get("invoked_resource") == item.source_file
+                            and edge.attributes.get("instruction_node_id") in {value["instruction_node_id"] for value in bound_calls}
+                            and (source := graph.node_by_id(edge.source)) is not None and source.source_file == item.source_file]
+            if not return_edges:
+                continue
+            covered.append({
+                "evidence_version": 1, "instruction_node_id": node.node_id,
+                "code_node_id": item.node_id, "repair_id": item.repair_id,
+                "operation": "file_write", "target": target,
+                "source_file": item.source_file, "source_span": {
+                    "start_line": code_range.start_line, "end_line": code_range.end_line,
+                    "start_column": code_range.start_column, "end_column": code_range.end_column,
+                },
+                "original_execution_run_id": original_record.run_id,
+                "original_target_write_count": len(original_writes),
+                "original_bound_tool_calls": bound_calls,
+                "patched_target_write_count": 0,
+                "safe_unit_sha256": item.metadata.get("safe_unit_sha256"),
+                "static_returns_to_edges": [
+                    {"source": edge.source, "target": edge.target, "attributes": dict(edge.attributes)} for edge in return_edges
+                ],
+            })
+        return covered
 
     def _projected_invocation_preserved(
         self,
@@ -693,6 +879,7 @@ class RepairValidator:
         template = item.metadata.get("instruction_invocation_template")
         template_matches = False
         expected_tool_name = ""
+        expected_commands: dict[str, list[str]] | None = None
         if isinstance(template, dict):
             prefix_tokens = template.get("prefix_tokens")
             source_token = str(template.get("source_token") or "")
@@ -721,19 +908,42 @@ class RepairValidator:
                 ".js": {"node", "nodejs"},
                 ".ts": {"node", "nodejs"},
             }.get(suffix, set())
-            template_matches = bool(
+            template_valid = bool(
                 self._normalized_relative_path(source_token)
                 == self._normalized_relative_path(source_file)
                 and isinstance(suffix_tokens, list)
-                and not suffix_tokens
-                and len(invocation_prefix) == 1
+                and all(isinstance(token, str) and token for token in suffix_tokens)
+                and isinstance(prefix_tokens, list)
+                and all(isinstance(token, str) and token for token in prefix_tokens)
+                and invocation_prefix
                 and invocation_prefix[0] in accepted_prefixes
-                and language_tokens & summary_tokens
                 and expected_tool_name
             )
-        # A filename mention is not enough: the projected runtime currently
-        # preserves only argument-free script invocations. Require the full
-        # recorded invocation template so arguments cannot be silently lost.
+            if template_valid:
+                original_tokens = [*invocation_prefix, source_token, *suffix_tokens]
+                parser = InstructionRewriter()
+                exact_summary_commands = self._inline_command_tokens(summary)
+                exact_original = original_tokens in exact_summary_commands
+                template_matches = bool(
+                    parser._direct_command_script_index(original_tokens) == len(invocation_prefix)
+                    and (exact_original or (
+                        len(invocation_prefix) == 1 and not suffix_tokens
+                        and language_tokens & summary_tokens
+                        and normalized_source in normalized_summary
+                    ))
+                )
+                if template_matches and exact_original:
+                    dispatch_commands = self._inline_command_tokens(str(item.metadata.get("instruction_dispatch_block") or ""))
+                    expected_commands = {
+                        unit: [*invocation_prefix, unit, *suffix_tokens]
+                        for unit in self._projected_execution_units(item)
+                        if [*invocation_prefix, unit, *suffix_tokens] in dispatch_commands
+                    }
+                    if not expected_commands:
+                        return False
+        # Flags and arguments are preserved only by an exact original-template,
+        # generated-dispatch, and observed-runtime command substitution. The
+        # existing argument-free semantic invocation path remains available.
         if not template_matches:
             return False
 
@@ -747,7 +957,7 @@ class RepairValidator:
             unit
             for unit in projected_units
             if unit in graph_units
-            or Path(unit).name in {Path(graph_unit).name for graph_unit in graph_units}
+            and (expected_commands is None or unit in expected_commands)
         }
         if not represented_units:
             return False
@@ -756,7 +966,18 @@ class RepairValidator:
             record=record,
             projected_units=represented_units,
             expected_tool_name=expected_tool_name,
+            expected_commands=expected_commands,
         )
+
+    @staticmethod
+    def _inline_command_tokens(text: str) -> list[list[str]]:
+        commands = []
+        for command in re.findall(r"(?<!`)`([^`\r\n]+)`(?!`)", text):
+            try:
+                commands.append(shlex.split(command, posix=True))
+            except ValueError:
+                continue
+        return commands
 
     def _observed_projected_tool_invocation(
         self,
@@ -764,6 +985,7 @@ class RepairValidator:
         record: ExecutionRecord,
         projected_units: set[str],
         expected_tool_name: str,
+        expected_commands: dict[str, list[str]] | None = None,
     ) -> bool:
         """Require a concrete top-level tool call to one projected unit.
 
@@ -804,12 +1026,29 @@ class RepairValidator:
                 or ""
             )
             normalized_reference = self._normalized_relative_path(reference)
-            if any(
-                normalized_reference == unit
-                or normalized_reference.endswith("/" + unit)
-                for unit in normalized_units
-            ):
+            matching_units = {
+                unit for unit in normalized_units
+                if normalized_reference == unit or normalized_reference.endswith("/" + unit)
+            }
+            if not matching_units:
+                continue
+            if expected_commands is None:
                 return True
+            tool_call_id = attributes.get("tool_call_id")
+            if not tool_call_id:
+                continue
+            for operation in events:
+                details = operation.get("attributes")
+                if (
+                    operation.get("event_type") != "exec_command"
+                    or not isinstance(details, dict)
+                    or details.get("tool_call_id") != tool_call_id
+                    or details.get("tool_name") != expected_tool_name
+                ):
+                    continue
+                tokens = details.get("runtime_command_tokens")
+                if isinstance(tokens, list) and any(tokens == expected_commands.get(unit) for unit in matching_units):
+                    return True
         return False
 
     def _action_executed(

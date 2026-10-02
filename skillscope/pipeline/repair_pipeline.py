@@ -5,6 +5,7 @@ from pathlib import Path
 from skillscope.common.config import AppConfig
 from skillscope.common.io import ensure_directory, write_json
 from skillscope.module3_control_flow_constrained_repair import ControlFlowConstrainedRepairService
+from .validate_pipeline import coverage_summary, task_context_summary
 
 
 class RepairPipeline:
@@ -57,10 +58,24 @@ class RepairPipeline:
                 run.outcome.validation.goal_satisfied_count if run.outcome.validation else None
             ),
             "repair_success": (
-                run.outcome.validation.remaining_overreach_count == 0
+                bool(run.plan.items) and run.outcome.validation.repair_succeeded
                 if run.outcome.validation
                 else False
             ),
+            "repair_status": (
+                "not_required_or_not_validated"
+                if not run.plan.items
+                else "verified_repair"
+                if run.outcome.validation and run.outcome.validation.repair_succeeded
+                else "repair_not_verified"
+            ),
+            "original_task_count": len(run.validation_run.validation.tasks),
+            "original_triggered_task_count": sum(
+                evidence.triggered for evidence in run.validation_run.validation.trigger_evidence
+            ),
+            "original_final_verdict_count": len(run.validation_run.validation.final_verdicts),
+            "task_context_summary": task_context_summary(run.validation_run.validation),
+            **coverage_summary(run.validation_run.analysis, run.validation_run.validation),
             "explicit_user_prompt_count": len(user_prompts or []),
             "validation_mode": self.config.validation_mode,
             "artifact_dir": str(output_dir),

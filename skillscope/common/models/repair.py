@@ -73,6 +73,34 @@ class RepairValidationReport:
     def remaining_candidate_count(self) -> int:
         return self.remaining_overreach_count
 
+    @property
+    def repair_succeeded(self) -> bool:
+        """Require completed safety and utility evidence for an actual repair."""
+        verdicts = self.metadata.get("after_repair_final_verdicts", [])
+        return bool(
+            self.overreach_count > 0
+            and self.task_count > 0
+            and self.decision_count >= self.task_count
+            and self.remaining_overreach_count == 0
+            and self.completed_replay_pairs == self.decision_count
+            and self.successful_task_count == self.decision_count
+            and self.core_preserved_count == self.decision_count
+            and self.goal_satisfied_count == self.decision_count
+            and self.overprivileged_count == 0
+            and self.metadata.get("validation_mode") == "dynamic"
+            and self.metadata.get("after_repair_inconclusive_count") == 0
+            and isinstance(verdicts, list)
+            and len(verdicts) == self.decision_count
+            and all(
+                isinstance(verdict, dict)
+                and verdict.get("label") == "not_overprivileged"
+                and verdict.get("core_preserved") is True
+                and verdict.get("goal_satisfied") is True
+                and verdict.get("projection_integrity_complete") is True
+                for verdict in verdicts
+            )
+        )
+
 
 @dataclass(slots=True)
 class RepairOutcome:

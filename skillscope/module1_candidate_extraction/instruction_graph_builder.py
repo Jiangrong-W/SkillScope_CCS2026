@@ -479,9 +479,11 @@ class InstructionGraphBuilder:
             # interpreter, while avoiding the old behavior of treating every
             # mere filename mention as an execution request.
             invocation_pattern = re.compile(
-                r"\b(?:run|execute|invoke)\s+`?"
+                r"\b(?:run|execute|invoke|use)\s+(?:`?"
                 + re.escape(script.relative_path)
-                + r"`?(?=\s|[.,;:]|$)",
+                + r"`?(?=\s|[.,;:]|$)|\[[^\]\n]+\]\("
+                + re.escape(script.relative_path)
+                + r"\))",
                 flags=re.IGNORECASE,
             )
             if invocation_pattern.search(text):

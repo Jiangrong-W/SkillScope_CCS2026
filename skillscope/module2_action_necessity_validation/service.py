@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from skillscope.common.config import AppConfig
@@ -99,6 +99,7 @@ class ActionNecessityValidationService:
         authorization_decisions = []
         final_verdicts = []
         descriptors = []
+        original_execution_records: list[dict[str, object]] = []
         chain_coverage_reports: list[dict[str, object]] = []
         validation_mode = self.config.validation_mode
         explicit_prompts = self._normalize_user_prompts(user_prompts)
@@ -190,6 +191,14 @@ class ActionNecessityValidationService:
                     task=task,
                     candidate=candidate,
                 )
+                original_execution_records.append(
+                    {
+                        "task_id": task.task_id,
+                        "candidate_id": candidate.candidate_id,
+                        "task_context": self._task_context(task),
+                        "record": asdict(replay_outcome.original),
+                    }
+                )
                 trigger_evidence.append(replay_outcome.trigger_evidence)
                 if replay_outcome.replay_pair is None:
                     # No authorization, ablation verdict, combined verdict, or
@@ -264,6 +273,18 @@ class ActionNecessityValidationService:
                     for report in chain_coverage_reports
                 ),
                 "candidate_count": len(analysis.candidates),
+                "task_context_by_id": {
+                    task.task_id: {
+                        "source": self._task_context(task),
+                        "generation_strategy": task.generation_strategy,
+                    }
+                    for task in tasks
+                },
+                "task_counts_by_context": {
+                    context: sum(self._task_context(task) == context for task in tasks)
+                    for context in ("explicit_user_prompt", "representative")
+                },
+                "original_execution_records": original_execution_records,
                 "validation_mode": validation_mode,
                 "representative_task_count": sum(
                     task.generation_strategy
@@ -333,6 +354,14 @@ class ActionNecessityValidationService:
                 seen.add(value)
                 normalized.append(value)
         return normalized
+
+    @staticmethod
+    def _task_context(task: TaskSpec) -> str:
+        return (
+            "explicit_user_prompt"
+            if task.generation_strategy == "user_supplied_candidate_reaching_context"
+            else "representative"
+        )
 
     def _chain_for_task(
         self,

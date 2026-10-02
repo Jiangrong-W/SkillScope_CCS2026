@@ -15,6 +15,7 @@ from skillscope.common.models import (
     TaskSpec,
     TaskTriggerEvidence,
 )
+from skillscope.common.privilege import MATERIAL_EVENT_TYPES, material_event_matches_operation
 
 from .output_comparator import OutputComparator
 from .trace_normalizer import TraceNormalizer
@@ -26,19 +27,22 @@ from .validated_llm import (
 )
 
 
+_OBSERVED_RESULT_LOSS_CONTRACT = """   A completed replay can observably fail the goal. In particular, when
+   `output_comparison_fallback.strategy` is `observed_required_text_result_loss`,
+   the caller established a required text-result channel, a grounded original
+   result, intact capture, identical fixtures, and a completed replay with no
+   direct result. Set GoalSat=false. This is sufficient negative goal evidence,
+   even though the replay's explanatory no-result message is not a grounded
+   task result. Do not invent the missing result or flag this established
+   absence as material ambiguity. Failed execution, failed capture, and an
+   ungrounded hallucinated response remain inconclusive.
+"""
+
+
 class NecessityJudge:
     """Judge action necessity from CorePres(a, t) and GoalSat(t \\ a)."""
 
-    MATERIAL_EVENT_TYPES = {
-        "network_send",
-        "exec_command",
-        "file_read",
-        "file_write",
-        "file_access",
-        "delete",
-        "read_env",
-        "collect_identifier",
-    }
+    MATERIAL_EVENT_TYPES = MATERIAL_EVENT_TYPES
     MATERIAL_UNCERTAINTY_FLAGS = {
         "candidate_removal_unverified",
         "candidate_still_executed_in_replay",
@@ -74,6 +78,7 @@ class NecessityJudge:
         "replay_pair.replay_output",
         "replay_pair.original_output_grounded",
         "replay_pair.replay_output_grounded",
+        "replay_pair.replay_result_absence_observed",
         "replay_pair.candidate_absent_in_replay",
         "replay_pair.candidate_absence_verified",
         "replay_pair.goal_evidence_sufficient",
@@ -141,6 +146,7 @@ class NecessityJudge:
             payload=payload,
             schema_name="module2_dynamic_corepres_goalsat_judge",
             validator=lambda response: self._validate_llm_response(response, payload),
+            system_prompt_transform=self._system_prompt_with_runtime_contract,
         )
         if result.payload is not None:
             return self._decision_from_llm(payload, result.payload, result.attempts)
@@ -151,6 +157,15 @@ class NecessityJudge:
                 attempts=result.attempts,
             )
         return self._judge_with_fallback(payload, [])
+
+    @staticmethod
+    def _system_prompt_with_runtime_contract(system_prompt: str) -> str:
+        if _OBSERVED_RESULT_LOSS_CONTRACT in system_prompt:
+            return system_prompt
+        anchor = "4. `executed_in_original` must exactly match the supplied trigger evidence.\n"
+        if anchor in system_prompt:
+            return system_prompt.replace(anchor, _OBSERVED_RESULT_LOSS_CONTRACT + anchor, 1)
+        return system_prompt + "\n\n" + _OBSERVED_RESULT_LOSS_CONTRACT
 
     def _build_payload(
         self,
@@ -172,6 +187,9 @@ class NecessityJudge:
             ),
             replay_output_grounded=self._final_output_grounded(
                 replay_pair.replay
+            ),
+            replay_result_absence_observed=self._result_absence_observed(
+                replay_pair
             ),
         )
         core_preserved = self._core_preserved(
@@ -239,6 +257,9 @@ class NecessityJudge:
                 ),
                 "replay_output_grounded": self._final_output_grounded(
                     replay_pair.replay
+                ),
+                "replay_result_absence_observed": bool(
+                    output_comparison.get("replay_result_absence_observed")
                 ),
                 "candidate_absent_in_replay": candidate_removal["absent"],
                 "candidate_absence_verified": candidate_removal["verified"],
@@ -357,6 +378,12 @@ class NecessityJudge:
         )
         if executed is not None and executed != observed_trigger:
             errors.append("executed_in_original_conflicts_with_observed_trigger")
+        if (
+            payload["replay_pair"].get("output_comparison_fallback", {}).get("strategy")
+            == "observed_required_text_result_loss"
+            and goal_satisfied is not False
+        ):
+            errors.append("goal_satisfied_conflicts_with_observed_required_result_loss")
         expected_label = self._label_for_contract(
             triggered=observed_trigger,
             runs_completed=runs_completed,
@@ -716,41 +743,18 @@ class NecessityJudge:
             attributes = payload.get("attributes")
             if not isinstance(attributes, dict):
                 attributes = {}
-            event_type = str(payload.get("event_type") or "")
-            material_operation = str(
-                attributes.get("material_operation") or ""
-            )
-            material = (
-                event_type in self.MATERIAL_EVENT_TYPES
-                or material_operation in self.MATERIAL_EVENT_TYPES
-            )
-            same_summary = str(payload.get("summary") or "") == candidate.summary
-            identities = {
-                value
-                for value in (
-                    payload.get("node_id"),
-                    attributes.get("instruction_node_id"),
-                )
-                if isinstance(value, str) and value
-            }
-            if identities:
-                if candidate.node_id not in identities:
-                    continue
-                if material or same_summary:
-                    return True
-                continue
-            if material and self._strong_candidate_fingerprint_matches(
-                observed_operation=material_operation or event_type,
-                source_file=attributes.get("source_file"),
-                line_number=attributes.get("line_number"),
+            if self._matches_candidate_material_event(
+                event_type=str(payload.get("event_type") or ""),
+                node_id=payload.get("node_id"),
+                instruction_node_id=attributes.get("instruction_node_id"),
+                attributes=attributes,
+                candidate=candidate,
                 ablation=replay_pair.ablation,
             ):
                 return True
-
-        return (
-            not fingerprint_absent
-            and candidate.node_id in record.executed_node_ids
-        )
+        # executed_node_ids includes plan traversal and pure Python bookkeeping;
+        # it is not a substitute for a matching physical operation.
+        return False
 
     def _strong_candidate_fingerprint_matches(
         self,
@@ -759,6 +763,8 @@ class NecessityJudge:
         source_file: object,
         line_number: object,
         ablation: object,
+        source_start_column: object = None,
+        source_end_column: object = None,
     ) -> bool:
         expected_operation = getattr(ablation, "operation_type", None)
         expected_source = getattr(ablation, "source_file", None)
@@ -782,7 +788,7 @@ class NecessityJudge:
             normalized_source == normalized_expected
             or normalized_source.endswith(f"/{normalized_expected}")
         )
-        return (
+        matches = (
             source_matches
             and start_line <= line_number <= end_line
             and self._operation_matches(
@@ -790,6 +796,24 @@ class NecessityJudge:
                 expected=expected_operation,
             )
         )
+        if not matches:
+            return False
+        # When the tracer has exact call columns, keep separate same-line
+        # actions separate instead of attributing every write to one span.
+        expected_start_column = getattr(ablation, "source_start_column", None)
+        expected_end_column = getattr(ablation, "source_end_column", None)
+        if (
+            start_line == end_line == line_number
+            and isinstance(expected_start_column, int)
+            and isinstance(expected_end_column, int)
+            and isinstance(source_start_column, int)
+            and isinstance(source_end_column, int)
+        ):
+            return (
+                expected_start_column <= source_start_column
+                and source_end_column <= expected_end_column
+            )
+        return True
 
     def _operation_matches(
         self,
@@ -798,22 +822,8 @@ class NecessityJudge:
         expected: str | None,
     ) -> bool:
         if not expected:
-            return True
-        aliases = {
-            "send": "network_send",
-            "sync": "network_send",
-            "upload": "network_send",
-            "post": "network_send",
-            "execute": "exec_command",
-            "run": "exec_command",
-            "read": "file_access",
-            "write": "file_access",
-            "file_read": "file_access",
-            "file_write": "file_access",
-        }
-        normalized_observed = aliases.get(observed.lower(), observed.lower())
-        normalized_expected = aliases.get(expected.lower(), expected.lower())
-        return normalized_observed == normalized_expected
+            return False
+        return material_event_matches_operation(expected, observed)
 
     def _has_material_uncertainty(self, flags: list[str]) -> bool:
         return any(
@@ -830,6 +840,47 @@ class NecessityJudge:
         # Legacy/imported records predate this field; preserve compatibility.
         # Runtime-produced records always set it explicitly.
         return True if value is None else value is True
+
+    def _result_absence_observed(self, replay_pair: ReplayPairRecord) -> bool:
+        """Separate an observed empty result channel from unavailable evidence.
+
+        A failed runner, failed response synthesizer, changed fixtures, or a
+        capture/tool error cannot establish the causal effect of ablation.
+        """
+        original, replay = replay_pair.original, replay_pair.replay
+        if original.status != "completed" or replay.status != "completed":
+            return False
+        if not original.final_output.strip() or not self._final_output_grounded(original):
+            return False
+        metadata = replay.metadata
+        if metadata.get("final_output_strategy") != "llm_validated_no_direct_result_response":
+            return False
+        if metadata.get("final_output_grounded") is not False:
+            return False
+        if "no_direct_tool_result_text" not in metadata.get("final_output_uncertainty_flags", []):
+            return False
+        if replay.stdout.strip() or replay.stderr.strip():
+            return False
+        if metadata.get("final_output_direct_result_sha256") != []:
+            return False
+        if metadata.get("final_output_validation_errors"):
+            return False
+        original_fixtures = original.metadata.get("fixture_manifest_sha256")
+        replay_fixtures = metadata.get("fixture_manifest_sha256")
+        if not original_fixtures or original_fixtures != replay_fixtures:
+            return False
+        events = replay.raw_trace or [
+            {"event_type": event.event_type, "attributes": event.attributes}
+            for event in replay.trace
+        ]
+        for event in events:
+            event_type = str(event.get("event_type") or "")
+            attributes = event.get("attributes") or {}
+            if event_type in {"tool_call_error", "script_error", "exception", "capture_error"}:
+                return False
+            if isinstance(attributes, dict) and attributes.get("status") in {"failed", "error"}:
+                return False
+        return any(event.get("event_type") == "agent_run_end" for event in events)
 
     def _core_preserved(
         self,
@@ -889,26 +940,60 @@ class NecessityJudge:
         candidate: CandidateAction,
         ablation: object,
     ) -> bool:
-        identities = {
-            value
-            for value in (
-                item.get("node_id"),
-                item.get("instruction_node_id"),
-            )
-            if isinstance(value, str) and value
-        }
-        if identities:
-            return candidate.node_id in identities
-        observed_operation = str(
-            item.get("material_operation")
-            or item.get("event_type")
-            or ""
-        )
-        return self._strong_candidate_fingerprint_matches(
-            observed_operation=observed_operation,
-            source_file=item.get("source_file"),
-            line_number=item.get("line_number"),
+        return self._matches_candidate_material_event(
+            event_type=str(item.get("event_type") or ""),
+            node_id=item.get("node_id"),
+            instruction_node_id=item.get("instruction_node_id"),
+            attributes=item,
+            candidate=candidate,
             ablation=ablation,
+        )
+
+    def _matches_candidate_material_event(
+        self,
+        *,
+        event_type: str,
+        node_id: object,
+        instruction_node_id: object,
+        attributes: dict[str, object],
+        candidate: CandidateAction,
+        ablation: object,
+    ) -> bool:
+        """Match physical operations before considering caller or graph ids."""
+        if event_type in {"call", "return", "line", "instruction_step_start", "instruction_step_end"}:
+            return False
+        if attributes.get("ablated") is True:
+            return False
+        expected = getattr(ablation, "operation_type", None)
+        actual = event_type if event_type in self.MATERIAL_EVENT_TYPES else str(attributes.get("material_operation") or "")
+        if actual not in self.MATERIAL_EVENT_TYPES:
+            return False
+        if expected and not material_event_matches_operation(expected, event_type, attributes):
+            return False
+
+        has_source_span = (
+            candidate.layer == "code"
+            and getattr(ablation, "source_file", None)
+            and isinstance(getattr(ablation, "source_start_line", None), int)
+            and isinstance(getattr(ablation, "source_end_line", None), int)
+        )
+        if has_source_span:
+            # Compiling the ablated bundle renumbers node ids. Repeated ids or
+            # caller ids alone cannot identify which code operation occurred.
+            return self._strong_candidate_fingerprint_matches(
+                observed_operation=actual,
+                source_file=attributes.get("source_file"),
+                line_number=attributes.get("line_number"),
+                source_start_column=attributes.get("source_start_column"),
+                source_end_column=attributes.get("source_end_column"),
+                ablation=ablation,
+            )
+        if node_id == candidate.node_id:
+            return True
+        return (
+            candidate.layer == "instruction"
+            and bool(expected)
+            and instruction_node_id == candidate.node_id
         )
 
     def _event_signature(

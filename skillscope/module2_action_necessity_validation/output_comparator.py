@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 
 
 class OutputComparator:
@@ -13,11 +14,30 @@ class OutputComparator:
         task_summary: str,
         original_output_grounded: bool = True,
         replay_output_grounded: bool = True,
+        replay_result_absence_observed: bool = False,
     ) -> dict[str, object]:
         original_norm = self._normalize(original_output)
         replay_norm = self._normalize(replay_output)
-        prompt_norm = self._normalize(prompt)
-        task_norm = self._normalize(task_summary)
+
+        # A completed, observed run with no result on a required text-output
+        # channel is a negative outcome, rather than missing telemetry. The
+        # caller must establish capture integrity before enabling this branch.
+        if (
+            original_norm
+            and original_output_grounded
+            and replay_result_absence_observed
+            and self._requires_text_result(prompt)
+        ):
+            return {
+                "equivalent": False,
+                "evidence_sufficient": True,
+                "reason": "The original produced the requested text result; the completed replay observably produced no result on that channel.",
+                "strategy": "observed_required_text_result_loss",
+                "original_output_grounded": True,
+                "replay_output_grounded": replay_output_grounded,
+                "replay_result_absence_observed": True,
+                "uncertainty_flags": [],
+            }
 
         uncertainty_flags: list[str] = []
         if not original_norm:
@@ -38,16 +58,6 @@ class OutputComparator:
             uncertainty_flags.append("material_goal_ambiguity")
 
         equivalent = evidence_sufficient and original_norm == replay_norm
-        if evidence_sufficient and not equivalent and task_norm:
-            equivalent = task_norm in original_norm and task_norm in replay_norm
-        if evidence_sufficient and not equivalent and prompt_norm:
-            prompt_tokens = set(prompt_norm.split())
-            original_tokens = set(original_norm.split())
-            replay_tokens = set(replay_norm.split())
-            if prompt_tokens:
-                overlap_original = len(prompt_tokens & original_tokens) / len(prompt_tokens)
-                overlap_replay = len(prompt_tokens & replay_tokens) / len(prompt_tokens)
-                equivalent = overlap_original >= 0.4 and overlap_replay >= 0.4
 
         if not evidence_sufficient:
             reason = (
@@ -56,25 +66,45 @@ class OutputComparator:
             )
         elif equivalent:
             reason = (
-                "Original and replay outputs remain semantically aligned with "
-                "the task request."
+                "The grounded outputs match after Unicode canonicalization "
+                "and line-ending normalization."
             )
         else:
             reason = (
-                "Replay output no longer looks equivalent to the original task "
-                "outcome."
+                "The grounded outputs differ. Lexical overlap or a shared "
+                "task description cannot establish result equivalence; a "
+                "separate semantic judgment is required for paraphrases."
             )
         return {
             "equivalent": equivalent,
             "evidence_sufficient": evidence_sufficient,
             "reason": reason,
-            "strategy": "grounded_task_output_comparison",
+            "strategy": "grounded_exact_text_comparison",
             "original_output_grounded": original_output_grounded,
             "replay_output_grounded": replay_output_grounded,
+            "replay_result_absence_observed": replay_result_absence_observed,
             "uncertainty_flags": uncertainty_flags,
         }
 
     def _normalize(self, text: str) -> str:
-        normalized = re.sub(r"\s+", " ", text.strip().lower())
-        normalized = re.sub(r"[^a-z0-9 _.-]", "", normalized)
-        return normalized
+        # Preserve whitespace as well as punctuation and case. Formatting,
+        # quoted strings and code indentation can be the requested result.
+        # Canonically equivalent Unicode and platform line endings are the
+        # only equivalences this task-independent comparator establishes.
+        if not text.strip():
+            return ""
+        return unicodedata.normalize("NFC", text.replace("\r\n", "\n").replace("\r", "\n"))
+
+    @staticmethod
+    def _requires_text_result(prompt: str) -> bool:
+        """Recognize text-result tasks without assuming file tasks need stdout."""
+        text = prompt.casefold()
+        if re.search(r"\b(?:stdout|print|answer|respond|reply)\b|打印|回答", text):
+            return True
+        artifact_goal = re.search(
+            r"\b(?:save|write|export|create|generate)\b.{0,60}\b(?:file|pdf|docx|xlsx|pptx|artifact)\b|保存.{0,20}文件|生成.{0,20}文件",
+            text,
+        )
+        return not artifact_goal and bool(
+            re.search(r"\b(?:summarize|summary|calculate|format|return|show|tell)\b|摘要|总结|计算|返回|显示", text)
+        )

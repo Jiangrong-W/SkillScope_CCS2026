@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import builtins
 import contextlib
+import itertools
 import io
 import json
 import os
@@ -38,13 +39,27 @@ class _SandboxState:
         self.fixtures = fixtures
 
     def record(self, *, event_type: str, summary: str, object_ref: str | None = None, arguments_summary: str | None = None, attributes: dict[str, Any] | None = None) -> None:
+        evidence = dict(attributes or {})
+        if event_type in {
+            "file_read", "file_write", "network_send", "exec_command",
+            "read_env", "collect_identifier", "delete",
+        }:
+            location = _call_site_location(self)
+            if (
+                location.get("source_file") == evidence.get("source_file")
+                and location.get("line_number") == evidence.get("line_number")
+            ):
+                evidence.update(location)
+            evidence["runtime_evidence"] = "python_instrumented_operation"
+            evidence["temporal_order_observed"] = True
+            evidence["execution_count_observed"] = True
         self.trace_events.append(
             {
                 "event_type": event_type,
                 "summary": summary,
                 "object_ref": object_ref,
                 "arguments_summary": arguments_summary,
-                "attributes": attributes or {},
+                "attributes": evidence,
             }
         )
 
@@ -79,6 +94,11 @@ def _relative_to_sandbox(path: str, sandbox_root: Path) -> str:
 
 
 def _call_site(state: _SandboxState) -> tuple[str | None, int | None]:
+    location = _call_site_location(state)
+    return location.get("source_file"), location.get("line_number")
+
+
+def _call_site_location(state: _SandboxState) -> dict[str, Any]:
     frame = sys._getframe(2)
     sandbox_root = state.sandbox_root.resolve()
     while frame is not None:
@@ -87,11 +107,32 @@ def _call_site(state: _SandboxState) -> tuple[str | None, int | None]:
             frame_path = Path(filename)
             try:
                 relative = frame_path.resolve().relative_to(sandbox_root)
-                return relative.as_posix(), frame.f_lineno
+                location: dict[str, Any] = {
+                    "source_file": relative.as_posix(),
+                    "line_number": frame.f_lineno,
+                }
+                # PEP 657 positions are observed on the suspended caller's
+                # actual CALL instruction, including same-line operations.
+                # co_positions includes cache entries, so f_lasti // 2 is the
+                # matching code-unit offset in supported Python versions.
+                position = next(
+                    itertools.islice(frame.f_code.co_positions(), frame.f_lasti // 2, None),
+                    None,
+                )
+                if position is not None:
+                    start_line, end_line, start_column, end_column = position
+                    if all(isinstance(value, int) for value in position):
+                        location.update({
+                            "source_start_line": start_line,
+                            "source_end_line": end_line,
+                            "source_start_column": start_column,
+                            "source_end_column": end_column,
+                        })
+                return location
             except Exception:
                 pass
         frame = frame.f_back
-    return None, None
+    return {}
 
 
 def _fake_response(status_code: int = 200, text: str = "") -> types.SimpleNamespace:
@@ -197,8 +238,11 @@ def _install_runtime_hooks(state: _SandboxState) -> dict[str, Any]:
             return originals["open"](file, mode, *args, **kwargs)
         path_str = str(file)
         source_file, line_number = _call_site(state)
-        event_type = "file_write" if any(flag in mode for flag in ("w", "a", "+")) else "file_read"
-        if state.match_ablation(source_file=source_file, line_number=line_number, operation_type="file_access"):
+        event_type = "file_write" if any(flag in mode for flag in ("w", "a", "x", "+")) else "file_read"
+        if (
+            state.match_ablation(source_file=source_file, line_number=line_number, operation_type="file_access")
+            or state.match_ablation(source_file=source_file, line_number=line_number, operation_type=event_type)
+        ):
             state.record(
                 event_type=event_type,
                 summary=f"Ablated file access {path_str}",
@@ -206,11 +250,9 @@ def _install_runtime_hooks(state: _SandboxState) -> dict[str, Any]:
                 arguments_summary=mode,
                 attributes={"ablated": True, "source_file": source_file, "line_number": line_number},
             )
-            if "r" in mode and "b" not in mode:
+            if "b" not in mode:
                 return io.StringIO("")
-            if "r" in mode and "b" in mode:
-                return io.BytesIO(b"")
-            return io.StringIO()
+            return io.BytesIO(b"")
         try:
             confined = _confined_path(state, file)
         except PermissionError:

@@ -499,8 +499,13 @@ class RuntimeTraceRecorder:
                     matched_attributes["runtime_event_type"] = runtime_event_type
                     event_type = runtime_event_type
                 else:
-                    if node.operation_type is not None:
-                        matched_attributes["material_operation"] = node.operation_type
+                    if runtime_event_type in self._MATERIAL_OPERATION_TYPES:
+                        matched_attributes["material_operation"] = runtime_event_type
+                        matched_attributes["object_value_observed"] = True
+                        matched_attributes["arguments_value_observed"] = True
+                        matched_attributes["static_operation"] = node.operation_type
+                        matched_attributes["static_object_ref"] = node.object_ref
+                        matched_attributes["tuple_evidence"] = "python_instrumented_operation"
                     event_type = runtime_event_type
                 matched_payload = dict(payload)
                 matched_payload["event_type"] = event_type
@@ -605,6 +610,36 @@ class RuntimeTraceRecorder:
                 matched.append(node)
             elif node.operation_type in compatible_operations:
                 matched.append(node)
+        if event_type in self._MATERIAL_OPERATION_TYPES:
+            start_column = attributes.get("source_start_column")
+            end_column = attributes.get("source_end_column")
+            start_line = attributes.get("source_start_line", line_number)
+            end_line = attributes.get("source_end_line", line_number)
+            if isinstance(start_column, int) and isinstance(end_column, int):
+                positioned = [
+                    node for node in matched
+                    if node.source_range is not None
+                    and node.source_range.start_line == start_line
+                    and node.source_range.end_line == end_line
+                    and node.attributes.get("col_offset", node.source_range.start_column) == start_column
+                    and node.attributes.get("end_col_offset", node.source_range.end_column) == end_column
+                ]
+                if not positioned and len(matched) == 1:
+                    node = matched[0]
+                    source_range = node.source_range
+                    if (
+                        source_range is not None
+                        and node.attributes.get("col_offset", source_range.start_column) is None
+                        and node.attributes.get("end_col_offset", source_range.end_column) is None
+                    ):
+                        # Legacy externally supplied graphs have line-only
+                        # ranges.  A unique compatible operation on that line
+                        # remains attributable; competing actions do not.
+                        return matched
+                return positioned if len(positioned) == 1 else []
+            # A source line alone cannot distinguish two same-kind actions.
+            # Keep the raw physical event without guessing which UEG node ran.
+            return matched if len(matched) == 1 else []
         return matched
 
     def _match_shell_command_node(
@@ -715,6 +750,10 @@ class RuntimeTraceRecorder:
         node: UEGNode,
         payload: dict[str, object],
     ) -> str | None:
+        event_type = str(payload.get("event_type") or "")
+        if event_type not in {"source_command_execution", "source_coverage_execution", "line", "call", "return"}:
+            observed = payload.get("object_ref")
+            return observed if isinstance(observed, str) else None
         if isinstance(node.object_ref, str) and node.object_ref:
             return node.object_ref
         call_name = node.attributes.get("call_name")
@@ -737,6 +776,10 @@ class RuntimeTraceRecorder:
         node: UEGNode,
         payload: dict[str, object],
     ) -> str | None:
+        event_type = str(payload.get("event_type") or "")
+        if event_type not in {"source_command_execution", "source_coverage_execution", "line", "call", "return"}:
+            observed = payload.get("arguments_summary")
+            return observed if isinstance(observed, str) else None
         attributes = payload.get("attributes")
         runtime_command = (
             attributes.get("runtime_command")

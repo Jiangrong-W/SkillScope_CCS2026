@@ -71,6 +71,22 @@ class TraceNormalizer:
                         if isinstance(attributes.get("line_number"), int)
                         else None
                     ),
+                    "source_start_column": (
+                        attributes.get("source_start_column")
+                        if isinstance(attributes.get("source_start_column"), int)
+                        else None
+                    ),
+                    "source_end_column": (
+                        attributes.get("source_end_column")
+                        if isinstance(attributes.get("source_end_column"), int)
+                        else None
+                    ),
+                    "static_operation": self._string_or_none(attributes.get("static_operation")),
+                    "static_object_ref": self._string_or_none(attributes.get("static_object_ref")),
+                    "tuple_evidence": self._string_or_none(attributes.get("tuple_evidence")),
+                    "ablated": attributes.get("ablated") is True,
+                    "blocked": attributes.get("blocked") is True,
+                    "mocked": attributes.get("mocked") is True,
                     "temporal_order_observed": (
                         attributes.get("temporal_order_observed")
                         if isinstance(

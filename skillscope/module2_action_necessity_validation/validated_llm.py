@@ -48,6 +48,7 @@ class ValidatedLLMCaller:
         payload: dict[str, Any],
         schema_name: str,
         validator: ResponseValidator,
+        system_prompt_transform: Callable[[str], str] | None = None,
     ) -> ValidatedLLMResult:
         if self.prompt_loader is None:
             return ValidatedLLMResult(payload=None, attempts=0, validation_errors=["missing_prompt_loader"])
@@ -59,6 +60,8 @@ class ValidatedLLMCaller:
                 attempts=0,
                 validation_errors=[f"prompt_load_error:{type(exc).__name__}"],
             )
+        if system_prompt_transform is not None:
+            system_prompt = system_prompt_transform(system_prompt)
 
         latest_errors: list[str] = []
 

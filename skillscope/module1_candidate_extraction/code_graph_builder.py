@@ -793,6 +793,12 @@ class CodeGraphBuilder:
                 called_base = self._call_name(current.func)
                 if called_base != "call":
                     parts.append(called_base)
+            elif current is not None:
+                # A pathlib receiver can be a composed expression, e.g.
+                # ``(root / 'audit.txt').write_text(...)``.  Keep that receiver
+                # rather than reducing the callee to bare ``write_text`` and
+                # losing the method's filesystem semantics.
+                parts.append(f"({self._safe_ast_unparse(current)})")
             return ".".join(reversed(parts))
         return "call"
 
@@ -2205,7 +2211,12 @@ class CodeGraphBuilder:
                     node_type="CODE_ACTION",
                     summary=f"Call {func_name}",
                     source_file=relative_path,
-                    source_range=SourceRange(start_line=getattr(call, "lineno", 0), end_line=getattr(call, "end_lineno", getattr(call, "lineno", 0))),
+                    source_range=SourceRange(
+                        start_line=getattr(call, "lineno", 0),
+                        end_line=getattr(call, "end_lineno", getattr(call, "lineno", 0)),
+                        start_column=getattr(call, "col_offset", None),
+                        end_column=getattr(call, "end_col_offset", None),
+                    ),
                     raw_text=ast.unparse(call),
                     operation_type=operation_type,
                     object_ref=self._python_call_object_ref(
@@ -2554,6 +2565,17 @@ class CodeGraphBuilder:
             if keyword.arg
         }
         positional = [self._safe_ast_unparse(argument) for argument in call.args]
+        if (
+            isinstance(call.func, ast.Attribute)
+            and call.func.attr in {
+                "open", "read_text", "read_bytes", "write_text", "write_bytes",
+                "unlink", "rmdir", "mkdir", "touch", "chmod",
+            }
+            and operation_type in {"file_access", "file_read", "file_write", "delete"}
+        ):
+            # For Path methods the target is the receiver; write_text's first
+            # argument is the content, not the path being modified.
+            return self._safe_ast_unparse(call.func.value)[:160]
         if operation_type == "network_send":
             for keyword in ("json", "data", "files", "body", "payload", "content"):
                 if keyword_values.get(keyword):

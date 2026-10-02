@@ -504,6 +504,10 @@ class InstructionRewriter:
         item: RepairItem,
     ) -> tuple[int, int]:
         lines = content.splitlines()
+        if item.repair_type == "REORGANIZE_CODE_AND_ADD_DISPATCH":
+            invocation = self._grounded_dispatch_invocation(content=content, item=item)
+            line = int(invocation["line_number"])
+            return line, line
         if (
             item.source_file == instruction_file
             and item.source_start_line is not None
@@ -511,11 +515,6 @@ class InstructionRewriter:
             and 1 <= item.source_start_line <= item.source_end_line <= len(lines)
         ):
             return item.source_start_line, item.source_end_line
-        dispatch_script = item.metadata.get("dispatch_source_file")
-        if isinstance(dispatch_script, str):
-            for index, line in enumerate(lines, start=1):
-                if dispatch_script in line:
-                    return index, index
         raw_text = (item.raw_text or "").strip()
         if raw_text:
             for index, line in enumerate(lines, start=1):
@@ -567,6 +566,9 @@ class InstructionRewriter:
             )
             return updated
 
+        if item.repair_type == "REORGANIZE_CODE_AND_ADD_DISPATCH":
+            return self._project_dispatch_content(content=content, item=item)
+
         lines = content.splitlines(keepends=True)
         replacement_lines = self._replacement_lines(item)
         if (
@@ -595,10 +597,10 @@ class InstructionRewriter:
     ) -> tuple[str, dict[str, dict[str, object]]]:
         """Replace unique grounded action fragments inside one source range.
 
-        The projection accepts only a simple Markdown bullet because splitting
-        a prose paragraph, table row, code block, or numbered item can silently
-        alter its surrounding semantics.  Unsupported or ambiguous shapes fail
-        closed before any file is written.
+        A unique, single-line action in a top-level bullet or standalone prose
+        paragraph can be guarded without replacing its unrelated actions.
+        Structural Markdown and soft-wrapped paragraphs remain unsupported;
+        their interpretation cannot be established from a fragment alone.
         """
 
         lines = content.splitlines(keepends=True)
@@ -678,6 +680,10 @@ class InstructionRewriter:
             if not line_matches:
                 projected_lines.append(line)
                 continue
+            self._assert_projection_context(
+                lines=lines,
+                line_index=target_start_line - 1 + line_index,
+            )
             projected_lines.append(
                 self._project_compound_bullet_line(
                     line=line,
@@ -769,6 +775,76 @@ class InstructionRewriter:
             )
         return narrowest[0]
 
+    def _assert_projection_context(
+        self,
+        *,
+        lines: list[str],
+        line_index: int,
+    ) -> None:
+        fence: tuple[str, int] | None = None
+        frontmatter = False
+        for index, source_line in enumerate(lines[: line_index + 1]):
+            stripped = source_line.strip()
+            if index == 0 and stripped == "---":
+                frontmatter = True
+            elif frontmatter and stripped in {"---", "..."}:
+                frontmatter = False
+            marker = re.match(r"^ {0,3}(`{3,}|~{3,})(.*)$", source_line)
+            inside_fence = fence is not None
+            if marker is not None:
+                run, tail = marker.groups()
+                if fence is None:
+                    fence = (run[0], len(run))
+                elif (
+                    run[0] == fence[0]
+                    and len(run) >= fence[1]
+                    and not tail.strip()
+                ):
+                    fence = None
+            if index == line_index and (
+                frontmatter or inside_fence or marker is not None
+            ):
+                raise RuntimeError(
+                    "instruction projection failed closed: grounded fragment "
+                    "is inside frontmatter or a code fence"
+                )
+
+        body = lines[line_index].rstrip("\r\n")
+        self._assert_projection_line(body)
+        if re.match(r"^-\s+", body):
+            return
+        # A neighboring plain line can be part of the same soft-wrapped
+        # paragraph; splitting only one physical line could change its scope.
+        for neighbor in (line_index - 1, line_index + 1):
+            if not 0 <= neighbor < len(lines):
+                continue
+            text = lines[neighbor].strip()
+            if not text:
+                continue
+            if re.fullmatch(r"(?:=+|-+)", text):
+                raise RuntimeError(
+                    "instruction projection failed closed: a paragraph fragment "
+                    "cannot replace a setext heading"
+                )
+            if not re.match(r"^(?:#{1,6}\s|[-*+]\s|\d+[.)]\s|>|`{3,}|~{3,})", text):
+                raise RuntimeError(
+                    "instruction projection failed closed: ambiguous multiline "
+                    "paragraph around the grounded action"
+                )
+
+    def _assert_projection_line(self, body: str) -> None:
+        if (
+            not body.strip()
+            or body.startswith((" ", "\t"))
+            or re.match(r"^(?:#{1,6}(?:\s|$)|>|[*+]\s|\d+[.)]\s|<|`{3,}|~{3,})", body)
+            or "|" in body
+            or re.fullmatch(r"(?:[-*_]\s*){3,}", body)
+        ):
+            raise RuntimeError(
+                "instruction projection failed closed: grounded fragment "
+                "overlaps unsupported Markdown structure"
+            )
+
     def _project_compound_bullet_line(
         self,
         *,
@@ -778,11 +854,13 @@ class InstructionRewriter:
         newline_match = re.search(r"(?:\r\n|\n|\r)$", line)
         newline = newline_match.group(0) if newline_match else "\n"
         body = line[: -len(newline)] if newline_match else line
+        self._assert_projection_line(body)
         bullet = re.match(r"^(?P<marker>-\s+)", body)
         if bullet is None:
-            raise RuntimeError(
-                "instruction projection failed closed: partial atomic-action "
-                "projection requires a top-level '-' Markdown bullet"
+            return self._project_compound_paragraph_line(
+                body=body,
+                newline=newline,
+                matches=matches,
             )
         content_start = bullet.end()
         ordered = sorted(
@@ -826,6 +904,38 @@ class InstructionRewriter:
                 "instruction projection failed closed: grounded projection "
                 "produced an empty Markdown block"
             )
+        return "".join(output)
+
+    def _project_compound_paragraph_line(
+        self,
+        *,
+        body: str,
+        newline: str,
+        matches: list[dict[str, object]],
+    ) -> str:
+        output: list[str] = []
+        cursor = 0
+        ordered = sorted(matches, key=lambda value: int(value["start"]))
+        for index, match in enumerate(ordered):
+            residual = self._clean_surrounding_instruction(
+                body[cursor : int(match["start"])],
+                strip_leading=index > 0,
+                strip_trailing=True,
+            )
+            if residual:
+                output.append(residual + newline + newline)
+            item = match["item"]
+            assert isinstance(item, RepairItem)
+            output.extend(self._replacement_lines(item))
+            output.append(newline)
+            cursor = int(match["end"])
+        residual = self._clean_surrounding_instruction(
+            body[cursor:],
+            strip_leading=True,
+            strip_trailing=False,
+        )
+        if residual:
+            output.append(residual + newline)
         return "".join(output)
 
     def _clean_surrounding_instruction(
@@ -1134,31 +1244,135 @@ class InstructionRewriter:
         is rewritten to an allowed/safe unit.
         """
 
-        source_file = str(
-            item.metadata.get("dispatch_source_file")
-            or item.source_file
-            or ""
-        ).strip()
-        if not source_file:
-            return
         content = target_file.read_text(encoding="utf-8")
-        for command in re.findall(r"`([^`\n]+)`", content):
-            try:
-                tokens = shlex.split(command, posix=True)
-            except ValueError:
-                continue
-            source_index = self._source_token_index(
-                tokens=tokens,
-                source_file=source_file,
-            )
-            if source_index is None:
-                continue
-            item.metadata["instruction_invocation_template"] = {
-                "prefix_tokens": tokens[:source_index],
-                "source_token": tokens[source_index],
-                "suffix_tokens": tokens[source_index + 1 :],
-            }
-            return
+        invocation = self._grounded_dispatch_invocation(content=content, item=item)
+        tokens = invocation["tokens"]
+        assert isinstance(tokens, list)
+        source_index = int(invocation["source_index"])
+        item.metadata["instruction_invocation_template"] = {
+            "prefix_tokens": tokens[:source_index],
+            "source_token": tokens[source_index],
+            "suffix_tokens": tokens[source_index + 1 :],
+        }
+        item.metadata["instruction_invocation_span"] = {
+            key: invocation[key]
+            for key in ("line_number", "start_column", "end_column", "matched_text")
+        }
+
+    def _grounded_dispatch_invocation(
+        self,
+        *,
+        content: str,
+        item: RepairItem,
+    ) -> dict[str, object]:
+        """Locate an executable command, never a filename mention.
+
+        A source token must occupy the script position in one supported direct
+        command and appear in an explicit invocation sentence.  Independent
+        prose around that inline command is outside the replacement span.
+        """
+
+        source_file = str(item.metadata.get("dispatch_source_file") or item.source_file or "").strip()
+        lines = content.splitlines(keepends=True)
+        matches: list[dict[str, object]] = []
+        for line_index, line in enumerate(lines):
+            inline_commands: list[tuple[re.Match[str], list[str], int]] = []
+            for match in re.finditer(r"(?<!`)`([^`\r\n]+)`(?!`)", line):
+                try:
+                    tokens = shlex.split(match.group(1), posix=True)
+                except ValueError:
+                    continue
+                script_index = self._direct_command_script_index(tokens)
+                if script_index is not None:
+                    inline_commands.append((match, tokens, script_index))
+            for match, tokens, script_index in inline_commands:
+                source_index = self._source_token_index(tokens=tokens, source_file=source_file)
+                if source_index != script_index:
+                    continue
+                prefix = line[:match.start()]
+                if not re.search(r"\b(?:run|execute|invoke|launch|use)\s*$", prefix, re.IGNORECASE):
+                    continue
+                try:
+                    self._assert_dispatch_projection_context(lines=lines, line_index=line_index)
+                except RuntimeError:
+                    # A header, example, table, or frontmatter mention does not
+                    # establish the skill's real invocation site.
+                    continue
+                if len(inline_commands) != 1:
+                    raise RuntimeError(
+                        "instruction dispatch projection failed closed: multiple "
+                        "executable commands share the invocation line"
+                    )
+                matches.append({
+                    "line_number": line_index + 1,
+                    "start_column": match.start(),
+                    "end_column": match.end(),
+                    "matched_text": match.group(0),
+                    "tokens": tokens,
+                    "source_index": source_index,
+                })
+        if len(matches) != 1:
+            reason = "no grounded executable invocation" if not matches else "multiple grounded executable invocations"
+            raise RuntimeError(f"instruction dispatch projection failed closed: {reason} for {source_file}")
+        return matches[0]
+
+    def _assert_dispatch_projection_context(
+        self,
+        *,
+        lines: list[str],
+        line_index: int,
+    ) -> None:
+        # Dispatch replaces only an inline command token, so the surrounding
+        # ordered-list marker need not be reinterpreted or rewritten. Keep the
+        # stricter atomic-action guard policy for numbered lists unchanged.
+        line = lines[line_index]
+        numbered = re.match(r"^\d+[.)]\s+", line)
+        if numbered is not None:
+            context_lines = list(lines)
+            context_lines[line_index] = "- " + line[numbered.end():]
+        else:
+            context_lines = lines
+        self._assert_projection_context(lines=context_lines, line_index=line_index)
+
+    def _direct_command_script_index(self, tokens: list[str]) -> int | None:
+        if not tokens or any(token in {";", "&&", "||", "|", ">", ">>", "<", "&"} for token in tokens):
+            return None
+        executable = Path(tokens[0]).name
+        if re.fullmatch(r"(?:python(?:\d+(?:\.\d+)*)?|pypy\d*|node|bun|sh|bash|dash|zsh|ksh|ts-node|tsx)", executable):
+            index = 1
+            value_options = {"-W", "-X", "--require", "-r", "--loader", "--import"}
+            while index < len(tokens) and tokens[index].startswith("-"):
+                option = tokens[index]
+                if option in {"-c", "-m", "-e", "--eval", "--print", "-p"} or option.startswith(("-c=", "--eval=")):
+                    return None
+                index += 2 if option in value_options else 1
+            if index < len(tokens) and Path(tokens[index]).suffix.casefold() in {".py", ".sh", ".js", ".mjs", ".cjs", ".ts", ".mts", ".cts"}:
+                return index
+            return None
+        if Path(tokens[0]).suffix.casefold() in {".py", ".sh", ".js", ".mjs", ".cjs", ".ts", ".mts", ".cts"}:
+            return 0
+        return None
+
+    def _project_dispatch_content(self, *, content: str, item: RepairItem) -> str:
+        invocation = self._grounded_dispatch_invocation(content=content, item=item)
+        lines = content.splitlines(keepends=True)
+        index = int(invocation["line_number"]) - 1
+        line = lines[index]
+        start, end = int(invocation["start_column"]), int(invocation["end_column"])
+        # Preserve every character outside the proven command token span.  The
+        # retained invocation points to the dispatch instead of providing an
+        # additional executable command that could bypass or duplicate it.
+        reference = "the execution unit selected by the task-conditioned dispatch below"
+        residual = line[:start] + reference + line[end:]
+        newline_match = re.search(r"(?:\r\n|\n|\r)$", line)
+        newline = newline_match.group(0) if newline_match else "\n"
+        if not residual.endswith(("\n", "\r")):
+            residual += newline
+        replacement = "".join(self._replacement_lines(item))
+        lines[index:index + 1] = [residual, newline, replacement]
+        item.metadata["instruction_projection_scope"] = "grounded_command_span"
+        item.metadata["instruction_projection_fragment"] = invocation["matched_text"]
+        return "".join(lines)
 
     def _source_token_index(
         self,
@@ -1169,22 +1383,13 @@ class InstructionRewriter:
         normalized_source = source_file.replace("\\", "/").removeprefix(
             "./"
         )
-        source_name = Path(normalized_source).name
         exact_matches: list[int] = []
-        basename_matches: list[int] = []
         for index, token in enumerate(tokens):
             normalized_token = token.replace("\\", "/").removeprefix("./")
-            if (
-                normalized_token == normalized_source
-                or normalized_token.endswith("/" + normalized_source)
-            ):
+            if normalized_token == normalized_source:
                 exact_matches.append(index)
-            elif Path(normalized_token).name == source_name:
-                basename_matches.append(index)
         if len(exact_matches) == 1:
             return exact_matches[0]
-        if not exact_matches and len(basename_matches) == 1:
-            return basename_matches[0]
         return None
 
     def _execution_command(
@@ -1217,21 +1422,7 @@ class InstructionRewriter:
         return quoted_path
 
     def _rewrite_dispatch_lines(self, lines: list[str], item: RepairItem, replacement_lines: list[str]) -> str:
-        dispatch_script = item.metadata.get("dispatch_source_file")
-        if isinstance(dispatch_script, str):
-            for index, line in enumerate(lines):
-                if dispatch_script in line:
-                    lines[index : index + 1] = replacement_lines
-                    return "".join(lines)
-        if item.raw_text:
-            updated = self._replace_by_raw_text("".join(lines), item, replacement_lines)
-            if updated != "".join(lines):
-                return updated
-        append_text = "".join(lines)
-        if append_text and not append_text.endswith("\n"):
-            append_text += "\n"
-        append_text += "".join(replacement_lines)
-        return append_text
+        return self._project_dispatch_content(content="".join(lines), item=item)
 
     def _replace_by_raw_text(self, content: str, item: RepairItem, replacement_lines: list[str]) -> str:
         raw_text = (item.raw_text or "").strip()
