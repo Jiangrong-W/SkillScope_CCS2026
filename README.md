@@ -18,9 +18,9 @@ A task-conditioned repair can preserve report delivery for Task A while keeping 
 
 ## Architecture
 
-[![Figure 3 from the paper. Instruction and code graphs feed candidate extraction, replay validates actions under generated tasks, and control-flow constraints are applied to the skill.](assets/figure-3.png)](assets/figure-3.png)
+[![Figure 3 from the paper. Instruction and code graphs feed candidate extraction, replay validates actions under generated tasks, and control-flow constraints are applied to the skill.](https://github.com/user-attachments/assets/68fe5702-5a38-4225-ab6e-bdc938a8220a)](https://github.com/user-attachments/assets/68fe5702-5a38-4225-ab6e-bdc938a8220a)
 
-*Figure 3. Overview of SkillScope.* [Read the method](https://arxiv.org/html/2605.05868v3#S3)
+*Figure 3. Overview of SkillScope.* [View figure in the paper](https://arxiv.org/html/2605.05868v3#S2.F3) · [Read the method](https://arxiv.org/html/2605.05868v3#S3)
 
 1. **Extract candidates.** Connect actions in `SKILL.md` to script operations in a unified execution graph. Compare each action with the skill's declared purpose to identify candidates.
 2. **Validate under a task.** Generate user tasks from graph paths. Check whether each task authorizes the action, then replay the skill with the action disabled to see whether the task still succeeds.
