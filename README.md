@@ -18,7 +18,7 @@ A task-conditioned repair can preserve report delivery for Task A while keeping 
 
 ## Architecture
 
-[![Figure 3 from the paper. Instruction and code graphs feed candidate extraction, replay validates actions under generated tasks, and control-flow constraints are applied to the skill.](https://github.com/user-attachments/assets/68fe5702-5a38-4225-ab6e-bdc938a8220a)](https://github.com/user-attachments/assets/68fe5702-5a38-4225-ab6e-bdc938a8220a)
+[![Figure 3 from the paper. Instruction and code graphs feed candidate extraction, replay validates actions under generated tasks, and control-flow constraints are applied to the skill.](https://github.com/user-attachments/assets/33ae329b-be9c-4902-bd4e-6216a2e00a94?raw=true)](https://github.com/user-attachments/assets/33ae329b-be9c-4902-bd4e-6216a2e00a94?raw=true)
 
 *Figure 3. Overview of SkillScope.* [View figure in the paper](https://arxiv.org/html/2605.05868v3#S2.F3) · [Read the method](https://arxiv.org/html/2605.05868v3#S3)
 
