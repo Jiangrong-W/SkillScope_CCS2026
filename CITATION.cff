@@ -1,0 +1,44 @@
+cff-version: 1.2.0
+message: "Please cite the CCS 2026 paper when using SkillScope."
+title: SkillScope
+type: software
+authors:
+  - family-names: Wu
+    given-names: Jiangrong
+  - family-names: Nan
+    given-names: Yuhong
+  - family-names: Lin
+    given-names: Yixi
+  - family-names: Wang
+    given-names: Huaijin
+  - family-names: Xiao
+    given-names: Yuming
+  - family-names: Wang
+    given-names: Shuai
+  - family-names: Zheng
+    given-names: Zibin
+repository-code: https://github.com/Jiangrong-W/SkillScope_CCS2026
+preferred-citation:
+  type: conference-paper
+  title: "SkillScope: Toward Fine-Grained Least-Privilege Enforcement for Agent Skills"
+  authors:
+    - family-names: Wu
+      given-names: Jiangrong
+    - family-names: Nan
+      given-names: Yuhong
+    - family-names: Lin
+      given-names: Yixi
+    - family-names: Wang
+      given-names: Huaijin
+    - family-names: Xiao
+      given-names: Yuming
+    - family-names: Wang
+      given-names: Shuai
+    - family-names: Zheng
+      given-names: Zibin
+  collection-title: Proceedings of the 2026 ACM SIGSAC Conference on Computer and Communications Security
+  year: 2026
+  start: 5657
+  end: 5671
+  doi: 10.1145/3830454.3846588
+  url: https://doi.org/10.1145/3830454.3846588
